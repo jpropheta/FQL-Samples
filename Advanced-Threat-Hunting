@@ -1,0 +1,316 @@
+1. Process Hollowing com Correlação de Memory Allocation
+fql
+#event_simpleName=ProcessRollup2
+| ImageSubsystem="IMAGE_SUBSYSTEM_WINDOWS_CUI"
+| join(query={
+    #event_simpleName=RemoteThreadCreate
+    | TargetProcessId=SourceProcessId // Self-injection indicator
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[TargetThreadId, SourceThreadId])
+| join(query={
+    #event_simpleName=ImageHash
+    | MD5HashData!=""
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[MD5HashData, SHA256HashData])
+| join(query={
+    #event_simpleName=ProcessRollup2 
+    | ParentImageFileName!=ImageFileName // Child different from parent
+}, field=aid, key=aid, mode=inner, start=-30s, end=+30s, include=[ParentImageFileName, ImageFileName])
+| eval(HollowingIndicators=0)
+| eval(HollowingIndicators=if(TargetThreadId!=SourceThreadId, HollowingIndicators+2, HollowingIndicators))
+| eval(HollowingIndicators=if(ParentImageFileName=/.*svchost\.exe|.*explorer\.exe/i, HollowingIndicators+1, HollowingIndicators))
+| eval(HollowingIndicators=if(ImageSubsystem="IMAGE_SUBSYSTEM_WINDOWS_CUI", HollowingIndicators+1, HollowingIndicators))
+| HollowingIndicators >= 3
+| stats(max(HollowingIndicators, as=HollowingScore), count(as=InjectionEvents)) by [aid, MD5HashData, ParentImageFileName]
+| sort(HollowingScore, order=desc)
+Vantagem Exclusiva: Correlação de threads, memory allocation e image subsystem - impossível em outros EDRs.
+
+2. Driver Load Anomalies com Certificate Trust Chain
+fql
+#event_simpleName=DriverLoad
+| join(query={
+    #event_simpleName=AuthenticodeData
+    | (SubjectCN!="Microsoft Corporation" AND SubjectCN!="Microsoft Windows" AND 
+       IssuerCN!="Microsoft Code Signing PCA" AND IssuerCN!="Microsoft Windows Verification PCA")
+}, field=[aid, ContextProcessId], key=[aid, TargetProcessId], mode=inner, include=[SubjectCN, IssuerCN, Timestamp])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | TokenType="TokenElevationTypeFull"
+}, field=[aid, ContextProcessId], key=[aid, RawProcessId], mode=inner, include=[UserName, TokenType])
+| eval(CertificateRisk=case([
+    (SubjectCN="" OR IssuerCN="") | 4; // No certificate
+    (SubjectCN=/.*test.*|.*debug.*|.*temp.*/i) | 3; // Test certificates
+    (Timestamp<now()-31536000000) | 2; // Certificate older than 1 year
+    (SubjectCN!=IssuerCN AND IssuerCN!=/.*Microsoft.*/i) | 2; // Non-MS signed
+    * | 1;
+]))
+| CertificateRisk >= 2
+| case {
+    ImageFileName=/.*\.sys$/i | DriverType := "Kernel_Driver";
+    ImageFileName=/.*flt$/i | DriverType := "Filter_Driver";  
+    * | DriverType := "Unknown_Driver";
+}
+| stats(max(CertificateRisk, as=MaxRisk), count(as=LoadAttempts)) by [aid, UserName, DriverType, SubjectCN]
+| sort(MaxRisk, order=desc)
+Vantagem Exclusiva: Correlação profunda de drivers, certificados e context process - dados únicos da CrowdStrike.
+
+3. DNS Tunneling via Process Ancestry Chain
+fql
+#event_simpleName=DnsRequest
+| (DomainName=/.*\.tk$|.*\.ml$|.*\.ga$|.*\.cf$/i OR 
+   RequestType!="A" OR 
+   length(DomainName) > 50)
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | ParentImageFileName!=""
+}, field=[aid, ContextProcessId], key=[aid, RawProcessId], mode=inner, include=[ParentImageFileName, CommandLine, ImageFileName])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | ParentImageFileName!=""
+}, field=[aid, ParentProcessId], key=[aid, RawProcessId], mode=left, include=[ParentImageFileName, CommandLine], suffix="_grandparent")
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemotePort=53 OR LocalPort=53
+}, field=[aid, ContextProcessId], key=[aid, RawProcessId], mode=left, start=-10s, end=+10s, include=[RemoteAddressIP4])
+| eval(ProcessChain=format("%s->%s->%s", 
+                         [ParentImageFileName_grandparent, ParentImageFileName, ImageFileName]))
+| eval(TunnelingRisk=0)
+| eval(TunnelingRisk=if(length(DomainName) > 50, TunnelingRisk+3, TunnelingRisk))
+| eval(TunnelingRisk=if(RequestType!="A", TunnelingRisk+2, TunnelingRisk))
+| eval(TunnelingRisk=if(DomainName=/.*\.tk$|.*\.ml$/i, TunnelingRisk+2, TunnelingRisk))
+| eval(TunnelingRisk=if(ParentImageFileName=/.*powershell\.exe|.*cmd\.exe/i, TunnelingRisk+1, TunnelingRisk))
+| TunnelingRisk >= 3
+| stats(max(TunnelingRisk, as=MaxTunnelingScore), dc(DomainName, as=UniqueDomains), 
+        count(as=DNSRequests)) by [aid, ProcessChain, RequestType]
+| sort(MaxTunnelingScore, order=desc)
+Vantagem Exclusiva: Visibilidade completa da ancestry chain de processos com correlação DNS - impossível em logs tradicionais.
+
+4. Token Privilege Escalation com Session Context
+fql
+#event_simpleName=ProcessRollup2
+| TokenType="TokenElevationTypeFull"
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonType!="2" // Not interactive logon but got elevated token
+}, field=aid, key=aid, mode=inner, start=-5m, end=+1m, include=[LogonType, UserName, SessionId])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*runas|.*psexec.*-s|.*invoke-command.*-credential/i
+}, field=aid, key=aid, mode=left, start=-2m, end=+2m, include=[CommandLine])
+| join(query={
+    #event_simpleName=SyntheticProcessRollup2
+    | IntegrityLevel="System" OR IntegrityLevel="High"
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=left, include=[IntegrityLevel])
+| case {
+    (LogonType="3" AND TokenType="TokenElevationTypeFull") | EscalationVector := "Network_To_Elevated";
+    (LogonType="4" AND IntegrityLevel="System") | EscalationVector := "Batch_To_System";
+    (LogonType="5" AND TokenType="TokenElevationTypeFull") | EscalationVector := "Service_Escalation";
+    (CommandLine!="" AND TokenType="TokenElevationTypeFull") | EscalationVector := "Command_Line_Escalation";
+    * | EscalationVector := "Unknown_Escalation";
+}
+| eval(SessionRisk=case([
+    (SessionId="0" AND LogonType!="0") | 3; // Session 0 isolation bypass
+    (UserName=/.*guest.*|.*anonymous.*/i) | 3; // Guest account escalation
+    (LogonType="3" AND IntegrityLevel="System") | 2; // Network to system
+    * | 1;
+]))
+| SessionRisk >= 2
+| stats(max(SessionRisk, as=RiskLevel), count(as=EscalationAttempts)) by [aid, UserName, EscalationVector, SessionId]
+| sort(RiskLevel, order=desc)
+Vantagem Exclusiva: Correlação de tokens, integrity levels, session context e synthetic process data.
+
+5. Reflective DLL Loading com Memory Pattern Analysis
+fql
+#event_simpleName=ProcessRollup2
+| ImageFileName=/.*rundll32\.exe|.*regsvr32\.exe/i
+| join(query={
+    #event_simpleName=ImageHash
+    | (MD5HashData="" OR SHA1HashData="") // No hash = reflective loading
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[MD5HashData, SHA1HashData])
+| join(query={
+    #event_simpleName=RemoteThreadCreate
+    | SourceProcessId!=TargetProcessId
+}, field=[aid, TargetProcessId], key=[aid, TargetProcessId], mode=inner, include=[SourceProcessId, TargetThreadId])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=[aid, SourceProcessId], key=[aid, RawProcessId], mode=left, start=-30s, end=+60s, include=[RemoteAddressIP4, RemotePort])
+| eval(ReflectiveIndicators=0)
+| eval(ReflectiveIndicators=if(MD5HashData="", ReflectiveIndicators+3, ReflectiveIndicators))
+| eval(ReflectiveIndicators=if(SourceProcessId!=TargetProcessId, ReflectiveIndicators+2, ReflectiveIndicators))
+| eval(ReflectiveIndicators=if(RemoteAddressIP4!="", ReflectiveIndicators+1, ReflectiveIndicators))
+| eval(ReflectiveIndicators=if(ImageFileName=/.*rundll32\.exe/i, ReflectiveIndicators+1, ReflectiveIndicators))
+| ReflectiveIndicators >= 4
+| case {
+    (CommandLine=/.*javascript|.*vbscript/i) | LoadingTechnique := "Script_Based_Reflective";
+    (CommandLine=/.*http|.*ftp/i) | LoadingTechnique := "Network_Reflective_DLL";
+    (RemoteAddressIP4!="") | LoadingTechnique := "C2_Reflective_Loading";
+    * | LoadingTechnique := "Local_Reflective_Loading";
+}
+| stats(max(ReflectiveIndicators, as=ThreatScore), count(as=LoadingEvents)) by [aid, LoadingTechnique, TargetThreadId]
+| sort(ThreatScore, order=desc)
+Vantagem Exclusiva: Detecção de reflective DLL loading via correlação de hash absence, threads e network.
+
+6. Stealthy Persistence via Image File Execution Options
+fql
+#event_simpleName=AsepValueUpdate
+| ValueName="Debugger"
+| RegObjectName=/.*Image File Execution Options.*/i
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*reg.*add.*ifeo|.*debugger/i
+}, field=aid, key=aid, mode=inner, start=-30s, end=+30s, include=[CommandLine, UserName])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | ParentImageFileName=/.*winlogon\.exe|.*userinit\.exe/i // Started by system process
+}, field=aid, key=aid, mode=left, start=+30s, end=+300s, include=[ParentImageFileName, ImageFileName])
+| regex("(?P<TargetExecutable>[^\\\\]+\\.exe)$", field=RegObjectName, strict=false)
+| regex("(?P<DebuggerPath>.*)", field=ValueData, strict=false)
+| case {
+    (DebuggerPath=/.*powershell|.*cmd|.*mshta/i) | PersistenceRisk := 4;
+    (DebuggerPath=/.*temp|.*appdata/i) | PersistenceRisk := 3;
+    (ParentImageFileName!="" AND TargetExecutable=/.*sethc|.*utilman|.*magnify/i) | PersistenceRisk := 4; // Sticky keys
+    * | PersistenceRisk := 2;
+}
+| PersistenceRisk >= 3
+| eval(SystemProcessHijack=case([
+    TargetExecutable=/.*sethc\.exe|.*utilman\.exe/i | "Accessibility_Hijack";
+    TargetExecutable=/.*taskmgr\.exe|.*regedit\.exe/i | "Admin_Tool_Hijack";  
+    ParentImageFileName=/.*winlogon\.exe/i | "Logon_Process_Hijack";
+    * | "General_IFEO_Hijack";
+]))
+| stats(max(PersistenceRisk, as=RiskLevel), count(as=HijackAttempts)) by [aid, UserName, SystemProcessHijack, TargetExecutable]
+| sort(RiskLevel, order=desc)
+Vantagem Exclusiva: Correlação de registry changes com process ancestry e system process context.
+
+7. Living-off-the-Land com Behavioral Baselining
+fql
+#event_simpleName=ProcessRollup2
+| FileName=/.*certutil\.exe|.*bitsadmin\.exe|.*wmic\.exe|.*forfiles\.exe/i
+| CommandLine!=/.*microsoft.*update|.*windows.*update/i // Exclude legitimate usage
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | stats(count(as=HistoricalUsage)) by [aid, FileName] 
+    | HistoricalUsage < 5 // Rare usage on this endpoint
+}, field=[aid, FileName], key=[aid, FileName], mode=inner, include=[HistoricalUsage])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=left, start=-30s, end=+120s, include=[RemoteAddressIP4])
+| case {
+    (FileName=/.*certutil\.exe/i AND CommandLine=/.*-urlcache.*-f.*http/i) | LOLBinTechnique := "Certutil_Download";
+    (FileName=/.*bitsadmin\.exe/i AND CommandLine=/.*transfer.*http/i) | LOLBinTechnique := "BITS_Download";
+    (FileName=/.*wmic\.exe/i AND CommandLine=/.*process.*call.*create/i) | LOLBinTechnique := "WMIC_Execution";
+    (FileName=/.*forfiles\.exe/i AND CommandLine=/.*\/c.*cmd/i) | LOLBinTechnique := "Forfiles_Proxy";
+    * | LOLBinTechnique := "Unknown_LOLBin";
+}
+| eval(AnomalyScore=case([
+    (HistoricalUsage=0 AND RemoteAddressIP4!="") | 5; // Never used + network
+    (HistoricalUsage<2 AND CommandLine=/.*-enc|.*-decode/i) | 4; // Rare + encoded
+    (HistoricalUsage<5 AND RemoteAddressIP4!="") | 3; // Infrequent + network
+    * | 1;
+]))
+| AnomalyScore >= 3
+| stats(max(AnomalyScore, as=MaxAnomaly), min(HistoricalUsage, as=MinUsage)) by [aid, UserName, LOLBinTechnique, FileName]
+| sort(MaxAnomaly, order=desc)
+Vantagem Exclusiva: Behavioral baselining por endpoint com historical process usage data.
+
+8. Advanced COM Object Hijacking
+fql
+#event_simpleName=AsepValueUpdate
+| RegObjectName=/.*CLSID.*InprocServer32/i
+| ValueName="(Default)"
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*regsvr32|.*com.*object|.*clsid/i
+}, field=aid, key=aid, mode=left, start=-60s, end=+60s, include=[CommandLine, UserName])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | ImageFileName=/.*dllhost\.exe|.*rundll32\.exe/i
+}, field=aid, key=aid, mode=inner, start=+10s, end=+300s, include=[ImageFileName, ParentImageFileName])
+| regex("(?P<CLSID>\\{[A-F0-9-]{36}\\})", field=RegObjectName, strict=false)
+| regex("(?P<DLLPath>.*\\.dll)", field=ValueData, strict=false)
+| case {
+    (DLLPath=/.*temp.*|.*appdata.*|.*users.*/i) | HijackRisk := 4; // User writable location
+    (DLLPath!=/.*system32.*|.*program files.*/i) | HijackRisk := 3; // Non-system location
+    (ImageFileName=/.*dllhost\.exe/i AND ParentImageFileName!=/.*svchost\.exe/i) | HijackRisk := 2; // Unusual parent
+    * | HijackRisk := 1;
+}
+| HijackRisk >= 2
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=[aid, ImageFileName], key=[aid, FileName], mode=left, start=+30s, end=+180s, include=[RemoteAddressIP4])
+| stats(max(HijackRisk, as=RiskLevel), count(as=HijackEvents)) by [aid, UserName, CLSID, DLLPath]
+| sort(RiskLevel, order=desc)
+Vantagem Exclusiva: Correlação profunda de registry, process loading e network context para COM hijacking.
+
+9. Kernel Callback Manipulation Detection
+fql
+#event_simpleName=DriverLoad
+| ImageFileName=/.*\.sys$/i
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | TokenType="TokenElevationTypeFull"
+    | IntegrityLevel="System"
+}, field=aid, key=aid, mode=inner, start=-60s, end=+60s, include=[UserName, IntegrityLevel])
+| join(query={
+    #event_simpleName=SyntheticProcessRollup2
+    | ProcessStartFlags!=""
+}, field=[aid, ContextProcessId], key=[aid, RawProcessId], mode=left, include=[ProcessStartFlags])
+| join(query={
+    #event_simpleName=AuthenticodeData
+    | SubjectCN!="Microsoft Corporation"
+}, field=[aid, ContextProcessId], key=[aid, TargetProcessId], mode=inner, include=[SubjectCN, IssuerCN])
+| eval(KernelRisk=case([
+    (SubjectCN="" OR SubjectCN=/.*test.*|.*debug.*/i) | 4; // Unsigned or test signed
+    (ProcessStartFlags!="" AND IntegrityLevel="System") | 3; // System process manipulation
+    (ImageFileName!=/.*microsoft.*|.*windows.*/i) | 2; // Non-Microsoft driver
+    * | 1;
+]))
+| KernelRisk >= 3
+| case {
+    ProcessStartFlags=/.*CREATE_SUSPENDED/i | ManipulationType := "Process_Suspension_Callback";
+    ProcessStartFlags=/.*CREATE_BREAKAWAY/i | ManipulationType := "Job_Breakaway_Callback";
+    SubjectCN="" | ManipulationType := "Unsigned_Kernel_Driver";
+    * | ManipulationType := "General_Kernel_Manipulation";
+}
+| stats(max(KernelRisk, as=MaxRisk), count(as=KernelEvents)) by [aid, UserName, ManipulationType, SubjectCN]
+| sort(MaxRisk, order=desc)
+Vantagem Exclusiva: Visibilidade única de kernel callbacks, process flags e driver context.
+
+10. Advanced Supply Chain Attack via Process Graph
+fql
+#event_simpleName=ProcessRollup2
+| ParentImageFileName=/.*msiexec\.exe|.*setup\.exe|.*install/i
+| join(query={
+    #event_simpleName=ImageHash 
+    | (MD5HashData!="" AND SHA256HashData!="")
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[MD5HashData, SHA256HashData])
+| join(query={
+    #event_simpleName=AuthenticodeData
+    | (SubjectCN!="" AND IssuerCN!="")
+}, field=[aid, TargetProcessId], key=[aid, TargetProcessId], mode=inner, include=[SubjectCN, IssuerCN, Timestamp])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*powershell|.*cmd|.*wscript/i
+}, field=aid, key=aid, mode=inner, start=+30s, end=+600s, include=[CommandLine, ImageFileName], suffix="_child")
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=aid, key=aid, mode=left, start=+60s, end=+1800s, include=[RemoteAddressIP4], suffix="_network")
+| eval(SupplyChainRisk=0)
+| eval(SupplyChainRisk=if(ParentImageFileName=/.*msiexec\.exe/i, SupplyChainRisk+1, SupplyChainRisk))
+| eval(SupplyChainRisk=if(CommandLine_child=/.*-enc.*-nop/i, SupplyChainRisk+3, SupplyChainRisk))
+| eval(SupplyChainRisk=if(RemoteAddressIP4_network!="", SupplyChainRisk+2, SupplyChainRisk))
+| eval(SupplyChainRisk=if(Timestamp<now()-7776000000, SupplyChainRisk+1, SupplyChainRisk)) // Old cert
+| SupplyChainRisk >= 4
+| eval(ProcessGraph=format("%s->%s->%s", 
+                          [ParentImageFileName, ImageFileName, ImageFileName_child]))
+| case {
+    (CommandLine_child=/.*downloadstring.*http/i) | AttackStage := "Installer_Download_Stage";
+    (CommandLine_child=/.*invoke-expression/i) | AttackStage := "Installer_Execution_Stage";
+    (RemoteAddressIP4_network!="" AND SubjectCN!=/.*Microsoft.*/i) | AttackStage := "Third_Party_Callback";
+    * | AttackStage := "General_Supply_Chain";
+}
+| stats(max(SupplyChainRisk, as=RiskLevel), count(as=ChainEvents)) by [aid, ProcessGraph, AttackStage, SubjectCN]
+| sort(RiskLevel, order=desc)
+Vantagem Exclusiva: Process graph completo com certificate timeline e supply chain context.
