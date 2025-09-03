@@ -1,0 +1,519 @@
+1. LGPD Compliance - Data Subject Rights Violation Detection
+fql
+#event_simpleName=FileRead OR #event_simpleName=FileWritten
+| (FilePath=/.*cpf.*|.*cnpj.*|.*dados.*pessoais.*|.*lgpd.*|.*titular.*dados.*/i OR
+   FileName=/.*cadastro.*\.xlsx|.*clientes.*\.csv|.*usuarios.*\.db|.*pessoas.*\.sql/i)
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*select.*cpf|.*export.*dados|.*backup.*database|.*mysqldump.*usuarios/i OR
+       FileName=/.*mysql.*\.exe|.*postgres.*\.exe|.*sqlcmd.*\.exe|.*bcp\.exe/i)
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, start=-300s, end=+300s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [21, 22, 25, 80, 443, 587, 3306, 5432] // Including DB ports
+}, field=aid, key=aid, mode=left, start=+60s, end=+1800s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | UserName!=/.*dpo.*|.*privacidade.*|.*compliance.*|.*juridico.*/i // Not authorized data handlers
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, include=[UserName])
+| regex("(?P<CPFCount>\\b\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2}\\b)", field=CommandLine, strict=false, flags=g)
+| eval(CPFCount=if(CPFCount=="", 0, mvcount(CPFCount)))
+| eval(LGPDViolationScore=0)
+| eval(LGPDViolationScore=if(CPFCount > 100, LGPDViolationScore+5, LGPDViolationScore)) // Bulk personal data
+| eval(LGPDViolationScore=if(CommandLine=/.*export.*dados|.*backup.*database/i, LGPDViolationScore+4, LGPDViolationScore))
+| eval(LGPDViolationScore=if(RemoteAddressIP4!="", LGPDViolationScore+3, LGPDViolationScore)) // External transfer
+| eval(LGPDViolationScore=if(UserName!=/.*dpo.*|.*compliance.*/i, LGPDViolationScore+2, LGPDViolationScore)) // Unauthorized user
+| LGPDViolationScore >= 7
+| eval(DataCategories=case([
+    (FilePath=/.*cpf.*cnpj/i) | "Identity_Financial_Data";
+    (FileName=/.*cadastro.*clientes/i) | "Customer_Registration_Data";
+    (CommandLine=/.*select.*cpf.*renda|.*dados.*financeiros/i) | "Sensitive_Financial_PII";
+    * | "General_Personal_Data";
+]))
+| case {
+    (RemoteAddressIP4!="" AND CPFCount > 1000) | LGPDViolationType := "Mass_Personal_Data_Exfiltration";
+    (CommandLine=/.*mysqldump.*usuarios/i) | LGPDViolationType := "Database_Dump_Personal_Data";
+    (UserName!=/.*dpo.*|.*compliance/i AND DataCategories="Sensitive_Financial_PII") | LGPDViolationType := "Unauthorized_Sensitive_Data_Access";
+    * | LGPDViolationType := "LGPD_Compliance_Violation";
+}
+| eval(DataVolumeCategory=case([
+    CPFCount > 10000 | "Critical_Volume_Violation"; // >10k records
+    CPFCount > 1000 | "High_Volume_Violation"; // >1k records
+    CPFCount > 100 | "Medium_Volume_Violation"; // >100 records
+    * | "Low_Volume_Access";
+]))
+| stats(max(LGPDViolationScore, as=MaxViolationScore),
+        sum(CPFCount, as=TotalPersonalRecords)) by [UserName, LGPDViolationType, DataVolumeCategory]
+| sort(MaxViolationScore, order=desc)
+Lacuna Crítica: Compliance específico com LGPD - essencial para empresas brasileiras evitarem multas de até 2% do faturamento.
+
+2. Brazilian Government Sector APT Detection
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*governo.*|.*ministerio.*|.*prefeitura.*|.*senado.*|.*camara.*|.*tse.*|.*stf.*|.*agu.*/i OR
+   CommandLine=/.*receita.*federal|.*bacen.*|.*cvm.*|.*ancine.*|.*anvisa.*|.*anatel.*/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4=/.*\.gov\.br$|.*\.leg\.br$|.*\.jus\.br$/i OR
+       RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND RemotePort in [80, 443, 22, 3389])
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*licitacao.*|.*processo.*administrativo|.*orcamento.*publico|.*contrato.*governo/i OR
+       FileName=/.*edital.*\.pdf|.*ata.*\.docx|.*processo.*\.xlsx/i)
+}, field=aid, key=aid, mode=left, start=-1800s, end=+1800s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FilePath=/.*siafi.*|.*siasg.*|.*comprasnet.*|.*e-sfinge.*|.*serpro.*/i OR
+       FileName=/.*classificado.*|.*restrito.*|.*confidencial.*|.*secreto.*/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[FilePath, FileName])
+| eval(GovernmentAPTScore=0)
+| eval(GovernmentAPTScore=if(CommandLine=/.*receita.*federal|.*bacen/i, GovernmentAPTScore+4, GovernmentAPTScore))
+| eval(GovernmentAPTScore=if(FilePath=/.*siafi.*|.*siasg/i, GovernmentAPTScore+5, GovernmentAPTScore)) // Critical gov systems
+| eval(GovernmentAPTScore=if(FileName=/.*classificado.*|.*confidencial/i, GovernmentAPTScore+4, GovernmentAPTScore))
+| eval(GovernmentAPTScore=if(RemoteAddressIP4!=/.*\.gov\.br/i AND RemotePort in [22, 3389], GovernmentAPTScore+3, GovernmentAPTScore))
+| GovernmentAPTScore >= 8
+| case {
+    (FilePath=/.*siafi.*/ AND RemoteAddressIP4!=/.*\.gov\.br/i) | APTTarget := "SIAFI_Financial_System_Compromise";
+    (CommandLine=/.*receita.*federal/i AND FileName=/.*confidencial/i) | APTTarget := "Tax_Authority_Classified_Data";
+    (CommandLine=/.*licitacao/i AND RemotePort=22) | APTTarget := "Public_Procurement_SSH_Access";
+    (FilePath=/.*serpro/i) | APTTarget := "SERPRO_Critical_Infrastructure";
+    * | APTTarget := "Brazilian_Government_Sector_APT";
+}
+| eval(GovernmentLevel=case([
+    CommandLine=/.*ministerio.*|.*senado.*|.*stf/i | "Federal_Government_Level";
+    CommandLine=/.*prefeitura.*|.*camara.*municipal/i | "Municipal_Government_Level";
+    CommandLine=/.*governo.*estadual/i | "State_Government_Level";
+    * | "General_Government_Sector";
+]))
+| stats(max(GovernmentAPTScore, as=MaxAPTScore),
+        count(as=GovernmentTargetingEvents)) by [aid, APTTarget, GovernmentLevel]
+| sort(MaxAPTScore, order=desc)
+Lacuna Crítica: APTs específicos contra setor público brasileiro - crítico para segurança nacional.
+
+3. Brazilian Energy Sector (Oil & Gas) Targeted Attacks
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*petrobras.*|.*pre.*sal.*|.*refinaria.*|.*petroleo.*|.*gas.*natural/i OR
+   CommandLine=/.*scada.*|.*hmi.*|.*dcs.*|.*plc.*|.*modbus.*|.*dnp3.*/i OR
+   ImageFileName=/.*wonderware.*|.*ge.*proficy.*|.*schneider.*|.*siemens.*step7.*/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemotePort in [502, 102, 20000, 44818, 4840] OR // Industrial protocol ports
+       RemoteAddressIP4=/^(192\.168\.|10\.0\.|172\.16\.)/i) // OT network ranges
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*exploracao.*petroleo|.*producao.*gas|.*upstream.*downstream/i OR
+       FileName=/.*reservatorio.*\.xlsx|.*producao.*\.csv|.*geologico.*\.pdf/i)
+}, field=aid, key=aid, mode=left, start=-900s, end=+900s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FilePath=/.*bacia.*santos.*|.*bacia.*campos.*|.*camada.*pre.*sal/i OR
+       FileName=/.*sismico.*|.*perfuracao.*|.*reservas.*|.*refino.*/i)
+}, field=aid, key=aid, mode=left, start=-300s, end=+300s, include=[FilePath, FileName])
+| eval(EnergyTargetScore=0)
+| eval(EnergyTargetScore=if(CommandLine=/.*petrobras.*|.*pre.*sal/i, EnergyTargetScore+5, EnergyTargetScore))
+| eval(EnergyTargetScore=if(RemotePort in [502, 102], EnergyTargetScore+4, EnergyTargetScore)) // Modbus/S7
+| eval(EnergyTargetScore=if(FilePath=/.*bacia.*santos.*|.*pre.*sal/i, EnergyTargetScore+4, EnergyTargetScore))
+| eval(EnergyTargetScore=if(CommandLine=/.*scada.*|.*hmi/i, EnergyTargetScore+3, EnergyTargetScore))
+| eval(EnergyTargetScore=if(FileName=/.*sismico.*|.*reservas/i, EnergyTargetScore+3, EnergyTargetScore))
+| EnergyTargetScore >= 9
+| case {
+    (FilePath=/.*pre.*sal/i AND RemotePort in [502, 102]) | EnergyThreat := "Pre_Salt_SCADA_Compromise";
+    (CommandLine=/.*petrobras/i AND FileName=/.*reservas/i) | EnergyThreat := "Petrobras_Reserves_Data_Theft";
+    (CommandLine=/.*refinaria/i AND RemotePort=102) | EnergyThreat := "Refinery_S7_Protocol_Attack";
+    (FileName=/.*exploracao.*geologico/i) | EnergyThreat := "Geological_Exploration_Data_Theft";
+    * | EnergyThreat := "Brazilian_Energy_Sector_Attack";
+}
+| eval(CriticalInfrastructure=case([
+    CommandLine=/.*petrobras.*refinaria/i | "Critical_Petrobras_Infrastructure";
+    CommandLine=/.*gas.*natural.*distribuicao/i | "Natural_Gas_Distribution";
+    FilePath=/.*bacia.*santos.*exploracao/i | "Santos_Basin_Exploration";
+    * | "General_Energy_Infrastructure";
+]))
+| stats(max(EnergyTargetScore, as=MaxEnergyScore),
+        count(as=EnergyAttackEvents)) by [aid, EnergyThreat, CriticalInfrastructure]
+| sort(MaxEnergyScore, order=desc)
+Lacuna Crítica: Proteção da infraestrutura crítica de energia brasileira - segurança nacional e econômica.
+
+4. Brazilian E-commerce Fraud (Marketplace & Payment)
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*mercado.*livre|.*americanas|.*magazine.*luiza|.*via.*varejo|.*b2w/i OR
+   CommandLine=/.*stone.*|.*pagseguro.*|.*cielo.*|.*rede.*|.*getnet.*|.*adyen.*/i OR
+   ImageFileName=/.*selenium.*|.*chromedriver.*|.*phantomjs.*|.*puppeteer.*/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND
+       RemotePort in [80, 443])
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*bot.*compra|.*automation.*checkout|.*scraping.*preco|.*estoque.*monitor/i OR
+       CommandLine=/.*cartao.*credito.*generator|.*cpf.*generator.*|.*dados.*fake/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[CommandLine])
+| join(query={
+    #event_simpleName=FileWritten OR #event_simpleName=FileRead
+    | (FileName=/.*cartoes.*\.txt|.*cpfs.*\.csv|.*contas.*\.xlsx|.*credenciais.*\.json/i OR
+       FilePath=/.*selenium.*downloads.*|.*bot.*data.*|.*automation.*results.*/i)
+}, field=aid, key=aid, mode=left, start=-300s, end=+1800s, include=[FileName, FilePath, Size])
+| regex("(?P<CreditCards>\\b(?:4\\d{3}|5[1-5]\\d{2}|6011|3[47]\\d{2})[-\\s]?\\d{4}[-\\s]?\\d{4}[-\\s]?\\d{4}\\b)", field=CommandLine, strict=false, flags=g)
+| regex("(?P<CPFs>\\b\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2}\\b)", field=CommandLine, strict=false, flags=g)
+| eval(CreditCardCount=if(CreditCards=="", 0, mvcount(CreditCards)))
+| eval(CPFCount=if(CPFs=="", 0, mvcount(CPFs)))
+| eval(EcommerceFraudScore=0)
+| eval(EcommerceFraudScore=if(CommandLine=/.*mercado.*livre.*bot|.*americanas.*automation/i, EcommerceFraudScore+4, EcommerceFraudScore))
+| eval(EcommerceFraudScore=if(CreditCardCount > 10, EcommerceFraudScore+5, EcommerceFraudScore))
+| eval(EcommerceFraudScore=if(CPFCount > 50, EcommerceFraudScore+4, EcommerceFraudScore))
+| eval(EcommerceFraudScore=if(CommandLine=/.*bot.*compra|.*checkout.*automation/i, EcommerceFraudScore+3, EcommerceFraudScore))
+| eval(EcommerceFraudScore=if(ImageFileName=/.*selenium.*|.*chromedriver/i, EcommerceFraudScore+2, EcommerceFraudScore))
+| EcommerceFraudScore >= 8
+| case {
+    (CommandLine=/.*mercado.*livre.*bot/i AND CreditCardCount > 0) | FraudType := "MercadoLivre_Automated_Card_Fraud";
+    (CommandLine=/.*pagseguro.*|.*cielo/i AND CPFCount > 100) | FraudType := "Payment_Gateway_Identity_Fraud";
+    (CommandLine=/.*estoque.*monitor.*compra.*bot/i) | FraudType := "Inventory_Monitoring_Scalping_Bot";
+    (CommandLine=/.*dados.*fake.*generator/i) | FraudType := "Synthetic_Identity_Generation";
+    * | FraudType := "Brazilian_Ecommerce_Automated_Fraud";
+}
+| eval(MarketplaceTarget=case([
+    CommandLine=/.*mercado.*livre/i | "MercadoLivre_Marketplace";
+    CommandLine=/.*americanas.*|.*b2w/i | "Americanas_B2W_Group";
+    CommandLine=/.*magazine.*luiza/i | "Magazine_Luiza_Marketplace";
+    CommandLine=/.*stone.*|.*pagseguro/i | "Payment_Gateway_Target";
+    * | "General_Brazilian_Ecommerce";
+]))
+| eval(DataVolumeMB=round(Size/1048576, 2))
+| stats(max(EcommerceFraudScore, as=MaxFraudScore),
+        sum(CreditCardCount, as=TotalCreditCards),
+        sum(CPFCount, as=TotalCPFs)) by [aid, FraudType, MarketplaceTarget]
+| sort(MaxFraudScore, order=desc)
+Lacuna Crítica: Proteção específica do e-commerce brasileiro - mercado de R$ 350 bilhões anuais.
+
+5. Brazilian Electoral System Security (TSE/Urnas)
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*tse.*|.*tribunal.*eleitoral|.*urna.*eletronica|.*boletim.*urna|.*bu.*eleicoes/i OR
+   CommandLine=/.*voto.*eletronico|.*apuracao.*votos|.*totalizacao.*eleicoes|.*sistema.*eleicoes/i OR
+   ImageFileName=/.*assinador.*tse.*|.*verificador.*bu.*|.*totalizador.*/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4=/.*tse\.jus\.br$|.*tre\..*\.jus\.br$/i OR
+       RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND RemotePort in [80, 443, 22])
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*\.bu$|.*\.bup$|.*\.logjez$|.*\.vscmr$/i OR
+       FilePath=/.*urna.*dados.*|.*boletim.*urna.*|.*totalizacao.*/i OR
+       FileName=/.*rdv.*|.*rnv.*|.*imgbu.*|.*dsajez.*/i)
+}, field=aid, key=aid, mode=inner, start=-300s, end=+300s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*crypto.*verify|.*assinatura.*digital|.*certificado.*a3|.*pkcs.*11/i OR
+       FileName=/.*openssl.*|.*certutil.*|.*signtool.*/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[CommandLine, FileName])
+| eval(ElectoralSecurityScore=0)
+| eval(ElectoralSecurityScore=if(CommandLine=/.*urna.*eletronica|.*boletim.*urna/i, ElectoralSecurityScore+5, ElectoralSecurityScore))
+| eval(ElectoralSecurityScore=if(FileName=/.*\.bu$|.*\.bup$/i, ElectoralSecurityScore+5, ElectoralSecurityScore)) // Ballot files
+| eval(ElectoralSecurityScore=if(FilePath=/.*totalizacao/i, ElectoralSecurityScore+4, ElectoralSecurityScore))
+| eval(ElectoralSecurityScore=if(RemoteAddressIP4!=/.*tse\.jus\.br/i AND RemotePort in [22, 443], ElectoralSecurityScore+3, ElectoralSecurityScore))
+| eval(ElectoralSecurityScore=if(CommandLine=/.*crypto.*verify|.*assinatura.*digital/i, ElectoralSecurityScore+2, ElectoralSecurityScore))
+| ElectoralSecurityScore >= 9
+| case {
+    (FileName=/.*\.bu$/ AND RemoteAddressIP4!=/.*tse\.jus\.br/i) | ElectoralThreat := "Ballot_Box_Data_Exfiltration";
+    (CommandLine=/.*totalizacao.*eleicoes/i AND RemotePort=22) | ElectoralThreat := "Vote_Totalization_SSH_Access";
+    (FilePath=/.*urna.*dados/i AND CommandLine=/.*assinatura.*digital/i) | ElectoralThreat := "Digital_Signature_Bypass_Attempt";
+    (CommandLine=/.*apuracao.*votos/i) | ElectoralThreat := "Vote_Counting_System_Compromise";
+    * | ElectoralThreat := "Brazilian_Electoral_System_Attack";
+}
+| eval(ElectoralPeriod=case([
+    (Time between ("2024-09-15", "2024-11-15")) | "Municipal_Election_Period_2024";
+    (Time between ("2026-08-15", "2026-11-15")) | "General_Election_Period_2026";
+    * | "Non_Electoral_Period";
+]))
+| eval(TSESystem=case([
+    FileName=/.*\.bu$|.*\.bup$/i | "Ballot_Box_Files";
+    CommandLine=/.*totalizacao/i | "Vote_Totalization_System";
+    ImageFileName=/.*assinador.*tse/i | "TSE_Digital_Signature_System";
+    * | "General_Electoral_System";
+]))
+| stats(max(ElectoralSecurityScore, as=MaxElectoralScore),
+        count(as=ElectoralEvents)) by [aid, ElectoralThreat, ElectoralPeriod, TSESystem]
+| sort(MaxElectoralScore, order=desc)
+Lacuna Crítica: Proteção do sistema eleitoral brasileiro - democracia e estabilidade institucional.
+
+6. Brazilian Healthcare Sector (SUS/ANVISA) Compliance
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*sus.*|.*datasus.*|.*cnes.*|.*sisreg.*|.*sismama.*|.*sinasc/i OR
+   CommandLine=/.*anvisa.*|.*medicamento.*|.*farmacovigilancia.*|.*vigilancia.*sanitaria/i OR
+   ImageFileName=/.*soul.*mv.*|.*tasy.*|.*wareline.*|.*aghu.*/i)
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*prontuario.*|.*paciente.*|.*atendimento.*|.*consulta.*\.db/i OR
+       FilePath=/.*cid.*10.*|.*cid.*11.*|.*tuss.*|.*cbhpm.*/i OR
+       FileName=/.*medicamento.*\.xlsx|.*prescricao.*\.pdf|.*laudo.*\.doc/i)
+}, field=aid, key=aid, mode=inner, start=-300s, end=+300s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND
+       RemotePort in [80, 443, 1433, 3306, 5432]) // Including healthcare DB ports
+}, field=aid, key=aid, mode=left, start=+60s, end=+1800s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | UserName!=/.*medico.*|.*enfermeiro.*|.*farmaceutico.*|.*admin.*sus/i // Unauthorized healthcare access
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, include=[UserName])
+| regex("(?P<CNS>\\b\\d{15}\\b)", field=CommandLine, strict=false, flags=g) // Cartão Nacional de Saúde
+| regex("(?P<CRM>\\b[A-Z]{2}[-\\s]?\\d{4,6}\\b)", field=CommandLine, strict=false, flags=g) // CRM numbers
+| eval(CNSCount=if(CNS=="", 0, mvcount(CNS)))
+| eval(CRMCount=if(CRM=="", 0, mvcount(CRM)))
+| eval(HealthcareSecurityScore=0)
+| eval(HealthcareSecurityScore=if(CommandLine=/.*datasus.*|.*sisreg/i, HealthcareSecurityScore+4, HealthcareSecurityScore))
+| eval(HealthcareSecurityScore=if(CNSCount > 100, HealthcareSecurityScore+5, HealthcareSecurityScore)) // Bulk patient data
+| eval(HealthcareSecurityScore=if(FileName=/.*prontuario.*paciente/i, HealthcareSecurityScore+4, HealthcareSecurityScore))
+| eval(HealthcareSecurityScore=if(RemoteAddressIP4!="", HealthcareSecurityScore+3, HealthcareSecurityScore))
+| eval(HealthcareSecurityScore=if(UserName!=/.*medico.*|.*admin.*sus/i, HealthcareSecurityScore+2, HealthcareSecurityScore))
+| HealthcareSecurityScore >= 8
+| case {
+    (CommandLine=/.*datasus/i AND CNSCount > 1000) | HealthcareThreat := "DATASUS_Bulk_Patient_Data_Access";
+    (FileName=/.*medicamento.*prescricao/i AND CRMCount > 0) | HealthcareThreat := "Prescription_Drug_Data_Theft";
+    (CommandLine=/.*anvisa.*farmacovigilancia/i) | HealthcareThreat := "ANVISA_Pharmacovigilance_Compromise";
+    (FilePath=/.*cid.*10/i AND RemoteAddressIP4!="") | HealthcareThreat := "Medical_Classification_Data_Exfiltration";
+    * | HealthcareThreat := "Brazilian_Healthcare_System_Breach";
+}
+| eval(HealthcareSystem=case([
+    CommandLine=/.*datasus.*|.*sus/i | "SUS_Public_Healthcare_System";
+    CommandLine=/.*anvisa/i | "ANVISA_Regulatory_System";
+    ImageFileName=/.*soul.*mv.*|.*tasy/i | "Hospital_Management_System";
+    FilePath=/.*cid.*10/i | "Medical_Classification_System";
+    * | "General_Healthcare_Infrastructure";
+]))
+| eval(PatientDataVolume=case([
+    CNSCount > 10000 | "Critical_Patient_Volume"; // >10k patients
+    CNSCount > 1000 | "High_Patient_Volume"; // >1k patients
+    CNSCount > 100 | "Medium_Patient_Volume"; // >100 patients
+    * | "Low_Patient_Volume";
+]))
+| eval(DataSizeMB=round(Size/1048576, 2))
+| stats(max(HealthcareSecurityScore, as=MaxHealthScore),
+        sum(CNSCount, as=TotalPatients),
+        sum(DataSizeMB, as=TotalDataMB)) by [aid, HealthcareThreat, HealthcareSystem, PatientDataVolume]
+| sort(MaxHealthScore, order=desc)
+Lacuna Crítica: Proteção do sistema de saúde brasileiro - dados sensíveis de 215 milhões de brasileiros.
+
+7. Brazilian Cloud Infrastructure Security (AWS/Azure Brasil)
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*aws.*s3.*|.*azure.*storage.*|.*gcp.*cloud.*storage/i OR
+   CommandLine=/.*terraform.*|.*cloudformation.*|.*arm.*template.*|.*kubernetes.*/i OR
+   FileName=/.*awscli.*|.*az\.exe|.*gcloud.*|.*kubectl.*/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4=/.*amazonaws\.com$|.*azure.*microsoft\.com$|.*googleapis\.com$/i OR
+       RemoteAddressIP4=/.*sa-east-1.*|.*brazil.*|.*southamerica.*/i) // Brazil regions
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*\.pem$|.*\.p12$|.*\.pfx$|.*\.key$|.*credentials.*|.*config.*aws/i OR
+       FilePath=/.*\.aws.*|.*\.azure.*|.*\.kube.*|.*terraform.*state/i)
+}, field=aid, key=aid, mode=left, start=-300s, end=+300s, include=[FileName, FilePath])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*access.*key.*|.*secret.*key.*|.*service.*principal.*|.*client.*secret/i OR
+       CommandLine=/.*iam.*policy.*|.*role.*assume.*|.*token.*assume/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[CommandLine])
+| eval(CloudSecurityScore=0)
+| eval(CloudSecurityScore=if(RemoteAddressIP4=/.*sa-east-1.*|.*southamerica/i, CloudSecurityScore+3, CloudSecurityScore)) // Brazil regions
+| eval(CloudSecurityScore=if(FileName=/.*\.pem$|.*\.key$/i, CloudSecurityScore+4, CloudSecurityScore)) // Private keys
+| eval(CloudSecurityScore=if(CommandLine=/.*access.*key.*|.*secret.*key/i, CloudSecurityScore+4, CloudSecurityScore))
+| eval(CloudSecurityScore=if(CommandLine=/.*iam.*policy.*admin|.*role.*admin/i, CloudSecurityScore+3, CloudSecurityScore))
+| eval(CloudSecurityScore=if(FilePath=/.*terraform.*state/i, CloudSecurityScore+2, CloudSecurityScore))
+| CloudSecurityScore >= 7
+| case {
+    (CommandLine=/.*aws.*s3.*sync.*--delete/i) | CloudThreat := "AWS_S3_Bulk_Data_Exfiltration";
+    (CommandLine=/.*iam.*policy.*admin.*attach/i) | CloudThreat := "IAM_Admin_Privilege_Escalation";
+    (FileName=/.*\.pem$/ AND RemoteAddressIP4=/.*sa-east-1/i) | CloudThreat := "Brazil_Region_Certificate_Access";
+    (CommandLine=/.*kubectl.*delete.*namespace/i) | CloudThreat := "Kubernetes_Namespace_Destruction";
+    * | CloudThreat := "Brazilian_Cloud_Infrastructure_Attack";
+}
+| eval(CloudProvider=case([
+    RemoteAddressIP4=/.*amazonaws\.com/i | "AWS_Brazil_Region";
+    RemoteAddressIP4=/.*azure.*microsoft\.com/i | "Azure_Brazil_Region";
+    RemoteAddressIP4=/.*googleapis\.com/i | "GCP_South_America";
+    * | "Multi_Cloud_Environment";
+]))
+| eval(BrazilianDataResidency=case([
+    RemoteAddressIP4=/.*sa-east-1.*|.*brazil.*south/i | "Brazilian_Data_Residency_Compliant";
+    RemoteAddressIP4=/.*us-east.*|.*eu-west/i | "International_Data_Transfer"; // LGPD concern
+    * | "Unknown_Data_Location";
+]))
+| stats(max(CloudSecurityScore, as=MaxCloudScore),
+        count(as=CloudSecurityEvents)) by [aid, CloudThreat, CloudProvider, BrazilianDataResidency]
+| sort(MaxCloudScore, order=desc)
+Lacuna Crítica: Proteção específica de cloud brasileiro - compliance LGPD e residência de dados.
+
+8. Brazilian Agribusiness Sector Protection
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*soja.*|.*milho.*|.*cana.*acucar.*|.*boi.*|.*frango.*|.*suino/i OR
+   CommandLine=/.*embrapa.*|.*incra.*|.*ibama.*|.*funai.*|.*cvm.*agro/i OR
+   ImageFileName=/.*sap.*agro.*|.*totvs.*agro.*|.*aegro.*|.*clima.*tempo.*/i)
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*plantio.*|.*colheita.*|.*safra.*|.*producao.*rural/i OR
+       FilePath=/.*geoprocessamento.*|.*sensoriamento.*remoto.*|.*precision.*agriculture/i OR
+       FileName=/.*commodities.*\.csv|.*futures.*\.xlsx|.*contratos.*soja.*/i)
+}, field=aid, key=aid, mode=inner, start=-300s, end=+300s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND
+       RemotePort in [80, 443, 21, 22])
+}, field=aid, key=aid, mode=left, start=+60s, end=+1800s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*chicago.*mercantile.*|.*cbot.*|.*ice.*futures.*|.*bmf.*bovespa/i OR
+       CommandLine=/.*radar.*meteorologico|.*satelite.*agricultura|.*drones.*plantacao/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[CommandLine])
+| eval(AgribusinessScore=0)
+| eval(AgribusinessScore=if(CommandLine=/.*soja.*milho.*producao/i, AgribusinessScore+3, AgribusinessScore))
+| eval(AgribusinessScore=if(FileName=/.*safra.*|.*colheita/i, AgribusinessScore+3, AgribusinessScore))
+| eval(AgribusinessScore=if(CommandLine=/.*bmf.*bovespa.*commodities/i, AgribusinessScore+4, AgribusinessScore))
+| eval(AgribusinessScore=if(FilePath=/.*geoprocessamento.*|.*sensoriamento.*remoto/i, AgribusinessScore+3, AgribusinessScore))
+| eval(AgribusinessScore=if(RemoteAddressIP4!="", AgribusinessScore+2, AgribusinessScore))
+| AgribusinessScore >= 7
+| case {
+    (CommandLine=/.*bmf.*bovespa.*soja/i AND FileName=/.*contratos.*futures/i) | AgroThreat := "Commodity_Futures_Market_Manipulation";
+    (FilePath=/.*geoprocessamento/i AND RemoteAddressIP4!="") | AgroThreat := "Agricultural_Land_Data_Theft";
+    (CommandLine=/.*radar.*meteorologico.*agricultura/i) | AgroThreat := "Weather_Intelligence_Industrial_Espionage";
+    (FileName=/.*producao.*rural.*colheita/i) | AgroThreat := "Agricultural_Production_Data_Theft";
+    * | AgroThreat := "Brazilian_Agribusiness_Sector_Attack";
+}
+| eval(AgriculturalRegion=case([
+    CommandLine=/.*mato.*grosso.*|.*cerrado/i | "Cerrado_Mato_Grosso_Region";
+    CommandLine=/.*rio.*grande.*sul.*|.*parana.*|.*santa.*catarina/i | "Southern_Brazil_Agriculture";
+    CommandLine=/.*bahia.*|.*piaui.*|.*maranhao.*|.*tocantins/i | "MATOPIBA_Agricultural_Frontier";
+    * | "General_Brazilian_Agriculture";
+]))
+| eval(CropType=case([
+    CommandLine=/.*soja/i | "Soybean_Production";
+    CommandLine=/.*milho/i | "Corn_Production";
+    CommandLine=/.*cana.*acucar/i | "Sugarcane_Production";
+    CommandLine=/.*boi.*|.*bovino/i | "Cattle_Ranching";
+    * | "Mixed_Agricultural_Production";
+]))
+| eval(DataSizeGB=round(Size/1073741824, 2))
+| stats(max(AgribusinessScore, as=MaxAgroScore),
+        sum(DataSizeGB, as=TotalAgriculturalDataGB)) by [aid, AgroThreat, AgriculturalRegion, CropType]
+| sort(MaxAgroScore, order=desc)
+Lacuna Crítica: Proteção do agronegócio brasileiro - 27% do PIB nacional e líder mundial em commodities.
+
+9. Brazilian Academic & Research Institution Security
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*usp.*|.*unicamp.*|.*ufrj.*|.*ufmg.*|.*puc.*|.*fapesp.*|.*cnpq.*|.*capes/i OR
+   CommandLine=/.*pesquisa.*academica|.*pos.*graduacao|.*mestrado.*|.*doutorado.*|.*ic.*cientifica/i OR
+   ImageFileName=/.*matlab.*|.*r\.exe|.*spss.*|.*stata.*|.*python.*jupyter.*/i)
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*dissertacao.*|.*tese.*|.*artigo.*|.*pesquisa.*\.pdf/i OR
+       FilePath=/.*dados.*pesquisa.*|.*experimento.*|.*laboratorio.*|.*biblioteca.*digital/i OR
+       FileName=/.*lattes.*|.*sucupira.*|.*plataforma.*brasil.*|.*comite.*etica.*/i)
+}, field=aid, key=aid, mode=inner, start=-300s, end=+300s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND
+       RemotePort in [80, 443, 22])
+}, field=aid, key=aid, mode=left, start=+60s, end=+1800s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*intellectual.*property|.*patente.*|.*propriedade.*intelectual|.*inpi/i OR
+       CommandLine=/.*bolsa.*cnpq|.*auxilio.*fapesp|.*projeto.*financiado/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[CommandLine])
+| eval(AcademicSecurityScore=0)
+| eval(AcademicSecurityScore=if(CommandLine=/.*usp.*|.*unicamp.*|.*ufrj/i, AcademicSecurityScore+3, AcademicSecurityScore))
+| eval(AcademicSecurityScore=if(FileName=/.*pesquisa.*dados.*|.*experimento/i, AcademicSecurityScore+4, AcademicSecurityScore))
+| eval(AcademicSecurityScore=if(CommandLine=/.*propriedade.*intelectual|.*patente/i, AcademicSecurityScore+4, AcademicSecurityScore))
+| eval(AcademicSecurityScore=if(FilePath=/.*laboratorio.*dados/i, AcademicSecurityScore+3, AcademicSecurityScore))
+| eval(AcademicSecurityScore=if(RemoteAddressIP4!="", AcademicSecurityScore+2, AcademicSecurityScore))
+| AcademicSecurityScore >= 8
+| case {
+    (CommandLine=/.*propriedade.*intelectual|.*patente/i AND RemoteAddressIP4!="") | AcademicThreat := "Intellectual_Property_Research_Theft";
+    (FileName=/.*dados.*pesquisa.*experimento/i AND CommandLine=/.*cnpq.*financiado/i) | AcademicThreat := "Funded_Research_Data_Exfiltration";
+    (FilePath=/.*laboratorio.*|.*biblioteca.*digital/i) | AcademicThreat := "Academic_Digital_Library_Breach";
+    (CommandLine=/.*lattes.*|.*sucupira/i) | AcademicThreat := "Academic_Curriculum_Database_Access";
+    * | AcademicThreat := "Brazilian_Academic_Institution_Attack";
+}
+| eval(AcademicInstitution=case([
+    CommandLine=/.*usp.*|.*unicamp/i | "Sao_Paulo_State_Universities";
+    CommandLine=/.*ufrj.*|.*ufmg.*|.*ufrgs/i | "Federal_Universities";
+    CommandLine=/.*fapesp.*|.*cnpq.*|.*capes/i | "Research_Funding_Agencies";
+    CommandLine=/.*puc.*|.*mackenzie/i | "Private_Universities";
+    * | "General_Academic_Research_Institution";
+]))
+| eval(ResearchArea=case([
+    ImageFileName=/.*matlab.*|.*r\.exe/i | "STEM_Statistical_Research";
+    FileName=/.*medicina.*|.*saude.*pesquisa/i | "Medical_Health_Research";
+    CommandLine=/.*biotecnologia.*|.*genetica/i | "Biotechnology_Genetics_Research";
+    * | "General_Academic_Research";
+]))
+| eval(DataSizeGB=round(Size/1073741824, 2))
+| stats(max(AcademicSecurityScore, as=MaxAcademicScore),
+        sum(DataSizeGB, as=TotalResearchDataGB)) by [aid, AcademicThreat, AcademicInstitution, ResearchArea]
+| sort(MaxAcademicScore, order=desc)
+Lacuna Crítica: Proteção da pesquisa acadêmica brasileira - propriedade intelectual e inovação nacional.
+
+10. Brazilian Critical Infrastructure Convergence Attack
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*aneel.*|.*ons.*|.*operador.*nacional.*sistema|.*setor.*eletrico/i OR
+   CommandLine=/.*antt.*|.*anac.*|.*antaq.*|.*ferrovias.*|.*portos.*|.*aeroportos/i OR
+   CommandLine=/.*anatel.*|.*telecomunicacoes.*|.*fibra.*optica.*|.*5g.*brasil/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemotePort in [102, 502, 2404, 20000, 44818, 4840] OR // Industrial protocols
+       RemoteAddressIP4=/^(192\.168\.|10\.0\.|172\.16\.)/i) // OT networks
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*scada.*|.*hmi.*|.*dcs.*|.*historian.*|.*wonderware.*|.*ge.*proficy/i OR
+       ImageFileName=/.*simatic.*|.*step7.*|.*tia.*portal.*|.*rslogix.*/i)
+}, field=aid, key=aid, mode=inner, start=-900s, end=+900s, include=[CommandLine, ImageFileName])
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*config.*plc.*|.*ladder.*logic.*|.*control.*logic.*|.*processo.*industrial/i OR
+       FilePath=/.*operacao.*|.*controle.*processo.*|.*automacao.*industrial/i)
+}, field=aid, key=aid, mode=left, start=-300s, end=+300s, include=[FileName, FilePath])
+| eval(CriticalInfraScore=0)
+| eval(CriticalInfraScore=if(CommandLine=/.*ons.*|.*operador.*nacional/i, CriticalInfraScore+5, CriticalInfraScore)) // Electric grid operator
+| eval(CriticalInfraScore=if(RemotePort in [102, 502], CriticalInfraScore+4, CriticalInfraScore)) // S7/Modbus protocols
+| eval(CriticalInfraScore=if(ImageFileName=/.*simatic.*|.*step7/i, CriticalInfraScore+4, CriticalInfraScore))
+| eval(CriticalInfraScore=if(FileName=/.*ladder.*logic.*|.*control.*logic/i, CriticalInfraScore+3, CriticalInfraScore))
+| eval(CriticalInfraScore=if(CommandLine=/.*5g.*brasil.*anatel/i, CriticalInfraScore+3, CriticalInfraScore))
+| CriticalInfraScore >= 9
+| case {
+    (CommandLine=/.*ons.*operador.*nacional/i AND RemotePort=102) | InfraThreat := "National_Electric_Grid_S7_Attack";
+    (CommandLine=/.*anatel.*5g/i AND FileName=/.*config.*telecom/i) | InfraThreat := "5G_Telecommunications_Infrastructure_Attack";
+    (CommandLine=/.*antt.*ferrovias/i AND ImageFileName=/.*simatic/i) | InfraThreat := "Railway_Transportation_SCADA_Attack";
+    (CommandLine=/.*antaq.*portos/i) | InfraThreat := "Port_Infrastructure_Control_System_Attack";
+    * | InfraThreat := "Brazilian_Critical_Infrastructure_Convergence_Attack";
+}
+| eval(InfrastructureSector=case([
+    CommandLine=/.*aneel.*|.*ons.*|.*setor.*eletrico/i | "Electric_Power_Grid";
+    CommandLine=/.*antt.*|.*ferrovias.*|.*portos/i | "Transportation_Infrastructure";
+    CommandLine=/.*anatel.*|.*telecomunicacoes.*|.*5g/i | "Telecommunications_Infrastructure";
+    CommandLine=/.*anac.*|.*aeroportos/i | "Aviation_Infrastructure";
+    * | "Multi_Sector_Critical_Infrastructure";
+]))
+| eval(IndustrialProtocol=case([
+    RemotePort=102 | "Siemens_S7_Protocol";
+    RemotePort=502 | "Modbus_TCP_Protocol";
+    RemotePort=2404 | "IEC_61850_Protocol";
+    RemotePort=44818 | "Ethernet_IP_Protocol";
+    * | "Generic_Industrial_Protocol";
+]))
+| stats(max(CriticalInfraScore, as=MaxInfraScore),
+        count(as=InfraAttackEvents),
+        dc(RemoteAddressIP4, as=UniqueOTTargets)) by [aid, InfraThreat, InfrastructureSector, IndustrialProtocol]
+| sort(MaxInfraScore, order=desc)
+Lacuna Crítica: Proteção convergente da infraestrutura crítica brasileira - segurança nacional sistêmica.
