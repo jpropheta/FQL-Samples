@@ -1,0 +1,520 @@
+1. Impossible Travel com Correlação de Device Fingerprint
+fql
+#event_simpleName=UserLogon
+| LogonResult="Success"
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult="Success"
+    | stats(min(@timestamp, as=FirstLogon), max(@timestamp, as=LastLogon),
+            collect([ComputerName, SourceIP], limit=50) as LogonHistory) by UserName
+}, field=UserName, key=UserName, mode=inner, include=[LogonHistory, FirstLogon, LastLogon])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | stats(collect([ImageFileName, MD5HashData], limit=100) as ProcessFingerprint) by [aid, UserName]
+}, field=[aid, UserName], key=[aid, UserName], mode=left, include=[ProcessFingerprint])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | stats(dc(RemoteAddressIP4, as=UniqueExternalIPs), 
+            collect(RemoteAddressIP4, limit=20) as ExternalIPs) by [aid, UserName]
+}, field=[aid, UserName], key=[aid, UserName], mode=left, include=[UniqueExternalIPs, ExternalIPs])
+| eval(CurrentLocation=case([
+    SourceIP=/^(200\.|201\.|186\.|189\.)/i | "Brazil_Primary";
+    SourceIP=/^(177\.|179\.|181\.)/i | "Brazil_Secondary"; 
+    SourceIP=/^(190\.|191\.|192\.)/i | "Latin_America";
+    SourceIP=/^(10\.|172\.|192\.168\.)/i | "Internal_Network";
+    * | format("International_%s", [SourceIP])
+]))
+| eval(PreviousLocations=mvindex(LogonHistory, -5, -1)) // Last 5 logons
+| eval(LocationChange=if(CurrentLocation not in (PreviousLocations), true, false))
+| eval(TimeDelta=(@timestamp - LastLogon) / 60000) // Minutes since last logon
+| eval(ImpossibleTravelScore=case([
+    (LocationChange=true AND TimeDelta < 60 AND CurrentLocation!="Internal_Network") | 5; // International travel in <1h
+    (LocationChange=true AND TimeDelta < 180 AND CurrentLocation=/.*International.*/i) | 4; // International in <3h
+    (LocationChange=true AND TimeDelta < 30) | 3; // Any location change in <30min
+    * | 0;
+]))
+| eval(DeviceConsistency=case([
+    (ComputerName not in (LogonHistory) AND ProcessFingerprint!="") | 2; // New device with different process profile
+    (ComputerName not in (LogonHistory)) | 1; // New device
+    * | 0;
+]))
+| eval(TravelRisk=ImpossibleTravelScore + DeviceConsistency)
+| TravelRisk >= 4
+| case {
+    (CurrentLocation=/.*International.*/ AND TimeDelta < 120) | TravelPattern := "Rapid_International_Travel";
+    (ComputerName not in (LogonHistory) AND LocationChange=true) | TravelPattern := "New_Device_Location_Change";
+    (UniqueExternalIPs > 10 AND LocationChange=true) | TravelPattern := "High_Network_Activity_Travel";
+    * | TravelPattern := "Generic_Impossible_Travel";
+}
+| stats(max(TravelRisk, as=MaxTravelRisk), 
+        min(TimeDelta, as=MinTimeBetweenLogons)) by [UserName, TravelPattern, CurrentLocation]
+| sort(MaxTravelRisk, order=desc)
+Técnica Exclusiva: Correlação de device fingerprinting com geolocalização e process profiling histórico.
+
+2. VPN/Proxy Detection com Behavioral Baseline
+fql
+#event_simpleName=UserLogon
+| LogonResult="Success"
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [1194, 1723, 4500, 500] // Common VPN ports
+}, field=aid, key=aid, mode=left, start=-300s, end=+300s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=DNSRequest
+    | (DomainName=/.*vpn.*|.*proxy.*|.*tunnel.*|.*hide.*ip.*|.*anonymous.*/i OR
+       DomainName=/.*expressvpn.*|.*nordvpn.*|.*surfshark.*|.*cyberghost.*/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[DomainName])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (FileName=/.*vpn.*\.exe|.*proxy.*\.exe|.*tunnel.*\.exe/i OR
+       CommandLine=/.*openvpn|.*wireguard|.*strongswan|.*l2tp/i)
+}, field=[aid, UserName], key=[aid, UserName], mode=left, start=-1800s, end=+1800s, include=[FileName, CommandLine])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult="Success"
+    | stats(dc(SourceIP, as=HistoricalIPCount), 
+            collect(SourceIP, limit=50) as HistoricalIPs,
+            avg(Time, as=AvgLogonTime)) by UserName // Behavioral baseline
+}, field=UserName, key=UserName, mode=inner, include=[HistoricalIPCount, HistoricalIPs, AvgLogonTime])
+| eval(VPNIndicators=0)
+| eval(VPNIndicators=if(RemotePort in [1194, 1723], VPNIndicators+3, VPNIndicators))
+| eval(VPNIndicators=if(DomainName!="", VPNIndicators+4, VPNIndicators))
+| eval(VPNIndicators=if(FileName!="" OR CommandLine!="", VPNIndicators+5, VPNIndicators))
+| eval(GeographicAnomaly=case([
+    (SourceIP not in (HistoricalIPs) AND HistoricalIPCount > 10) | 3; // New IP for established user
+    (SourceIP not in (HistoricalIPs) AND HistoricalIPCount <= 5) | 1; // New IP for new user
+    * | 0;
+]))
+| eval(TimeAnomaly=case([
+    (abs(Time - AvgLogonTime) > 10800000) | 2; // 3+ hours from usual time
+    (abs(Time - AvgLogonTime) > 3600000) | 1; // 1+ hour from usual time
+    * | 0;
+]))
+| eval(ProxyTravelScore=VPNIndicators + GeographicAnomaly + TimeAnomaly)
+| ProxyTravelScore >= 6
+| case {
+    (DomainName=/.*vpn.*/ AND SourceIP not in (HistoricalIPs)) | ProxyType := "Commercial_VPN_New_Location";
+    (CommandLine=/.*openvpn|.*wireguard/i) | ProxyType := "Technical_VPN_Usage";
+    (RemotePort in [1194, 1723] AND GeographicAnomaly >= 2) | ProxyType := "VPN_Port_Geographic_Anomaly";
+    * | ProxyType := "Generic_Proxy_Anonymization";
+}
+| eval(BrazilianIPContext=case([
+    SourceIP=/^(200\.|201\.|186\.|189\.)/i | "Brazilian_IP_Range";
+    SourceIP=/^(10\.|172\.|192\.168\.)/i | "Internal_Corporate";
+    * | "International_External";
+]))
+| stats(max(ProxyTravelScore, as=MaxProxyScore), 
+        count(as=ProxyLogonEvents)) by [UserName, ProxyType, BrazilianIPContext]
+| sort(MaxProxyScore, order=desc)
+Técnica Exclusiva: Detecção de VPN/Proxy com baseline comportamental temporal e geográfico.
+
+3. Concurrent Session Impossible Geography
+fql
+#event_simpleName=UserLogon
+| LogonResult="Success"
+| LogonType in ["2", "3", "10"] // Interactive, Network, RemoteDesktop
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult="Success"
+    | LogonType in ["2", "3", "10"]
+    | @timestamp > (now() - 3600000) // Active sessions in last hour
+}, field=UserName, key=UserName, mode=inner, include=[SourceIP, ComputerName, LogonType, @timestamp], suffix="_concurrent")
+| SourceIP != SourceIP_concurrent // Different source IPs
+| eval(TimeDifference=abs(@timestamp - @timestamp_concurrent) / 60000) // Minutes apart
+| TimeDifference <= 60 // Sessions within 60 minutes
+| eval(Location1=case([
+    SourceIP=/^(200\.|201\.|186\.|189\.)/i | "Brazil_Southeast";
+    SourceIP=/^(177\.|179\.)/i | "Brazil_Northeast";
+    SourceIP=/^(181\.)/i | "Brazil_South";
+    SourceIP=/^(190\.|191\.)/i | "Argentina_Chile";
+    SourceIP=/^(192\.)/i | "Colombia_Venezuela";
+    SourceIP=/^(10\.|172\.|192\.168\.)/i | "Internal_Network";
+    * | "International";
+]))
+| eval(Location2=case([
+    SourceIP_concurrent=/^(200\.|201\.|186\.|189\.)/i | "Brazil_Southeast";
+    SourceIP_concurrent=/^(177\.|179\.)/i | "Brazil_Northeast";  
+    SourceIP_concurrent=/^(181\.)/i | "Brazil_South";
+    SourceIP_concurrent=/^(190\.|191\.)/i | "Argentina_Chile";
+    SourceIP_concurrent=/^(192\.)/i | "Colombia_Venezuela";
+    SourceIP_concurrent=/^(10\.|172\.|192\.168\.)/i | "Internal_Network";
+    * | "International";
+]))
+| Location1 != Location2 // Different geographic regions
+| eval(GeographicDistance=case([
+    (Location1="Brazil_Southeast" AND Location2="International") | 5;
+    (Location1="Brazil_Northeast" AND Location2="International") | 5;
+    (Location1="Internal_Network" AND Location2="International") | 4;
+    (Location1="Brazil_Southeast" AND Location2="Argentina_Chile") | 3;
+    (Location1="Brazil_Northeast" AND Location2="Brazil_South") | 2;
+    * | 1;
+]))
+| eval(SessionTypeRisk=case([
+    (LogonType="2" AND LogonType_concurrent="10") | 3; // Local + RDP sessions
+    (LogonType="3" AND LogonType_concurrent="2") | 2; // Network + Interactive
+    * | 1;
+]))
+| eval(ConcurrentSessionScore=GeographicDistance + SessionTypeRisk + if(TimeDifference < 10, 2, 0))
+| ConcurrentSessionScore >= 6
+| case {
+    (Location1="Internal_Network" AND Location2="International") | ConcurrencyPattern := "Internal_External_Concurrent";
+    (GeographicDistance >= 4 AND TimeDifference < 30) | ConcurrencyPattern := "Rapid_Geographic_Concurrent";
+    (LogonType="2" AND LogonType_concurrent="10") | ConcurrencyPattern := "Local_Remote_Desktop_Concurrent";
+    * | ConcurrencyPattern := "Multi_Location_Concurrent_Sessions";
+}
+| stats(max(ConcurrentSessionScore, as=MaxConcurrentScore),
+        min(TimeDifference, as=MinSessionGap)) by [UserName, ConcurrencyPattern, Location1, Location2]
+| sort(MaxConcurrentScore, order=desc)
+Técnica Exclusiva: Detecção de sessões concorrentes geograficamente impossíveis com tipologia de logon.
+
+4. Machine Learning Behavioral Travel Anomaly
+fql
+#event_simpleName=UserLogon
+| LogonResult="Success"
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult="Success"
+    | timechart(span=1d, function=[
+        dc(SourceIP, as=DailyUniqueIPs),
+        dc(ComputerName, as=DailyUniqueHosts),
+        count(as=DailyLogons),
+        collect([SourceIP, Time], limit=100) as DailyPattern
+    ]) by UserName
+    | stats(avg(DailyUniqueIPs, as=AvgDailyIPs), 
+            avg(DailyUniqueHosts, as=AvgDailyHosts),
+            avg(DailyLogons, as=AvgDailyLogons)) by UserName
+}, field=UserName, key=UserName, mode=inner, include=[AvgDailyIPs, AvgDailyHosts, AvgDailyLogons])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult="Success"
+    | @timestamp > (now() - 86400000) // Last 24 hours
+    | stats(dc(SourceIP, as=Recent24hIPs),
+            dc(ComputerName, as=Recent24hHosts),
+            count(as=Recent24hLogons),
+            collect(SourceIP) as Recent24hIPList) by UserName
+}, field=UserName, key=UserName, mode=inner, include=[Recent24hIPs, Recent24hHosts, Recent24hLogons, Recent24hIPList])
+| eval(IPAnomalyScore=case([
+    (Recent24hIPs > (AvgDailyIPs * 4)) | 4; // 4x more IPs than usual
+    (Recent24hIPs > (AvgDailyIPs * 2)) | 2; // 2x more IPs than usual
+    * | 0;
+]))
+| eval(HostAnomalyScore=case([
+    (Recent24hHosts > (AvgDailyHosts * 3)) | 3; // 3x more hosts than usual
+    (Recent24hHosts > (AvgDailyHosts * 1.5)) | 1; // 1.5x more hosts than usual
+    * | 0;
+]))
+| eval(LogonVolumeScore=case([
+    (Recent24hLogons > (AvgDailyLogons * 5)) | 3; // 5x more logons than usual
+    (Recent24hLogons > (AvgDailyLogons * 2)) | 1; // 2x more logons than usual
+    * | 0;
+]))
+| eval(GeographicDiversityScore=case([
+    (Recent24hIPs > 10 AND SourceIP not in (Recent24hIPList)) | 3; // High diversity + new IP
+    (Recent24hIPs > 5 AND SourceIP not in (Recent24hIPList)) | 2; // Medium diversity + new IP
+    * | 0;
+]))
+| eval(MLBehavioralScore=IPAnomalyScore + HostAnomalyScore + LogonVolumeScore + GeographicDiversityScore)
+| MLBehavioralScore >= 6
+| eval(CurrentLocationContext=case([
+    SourceIP=/^(200\.|201\.|186\.|189\.)/i | "Brazil_Primary_ISP";
+    SourceIP=/^(177\.|179\.|181\.)/i | "Brazil_Secondary_ISP";
+    SourceIP=/^(10\.|172\.|192\.168\.)/i | "Corporate_Internal";
+    * | "External_International";
+]))
+| case {
+    (IPAnomalyScore >= 3 AND GeographicDiversityScore >= 2) | BehavioralAnomaly := "High_IP_Diversity_Anomaly";
+    (HostAnomalyScore >= 2 AND LogonVolumeScore >= 2) | BehavioralAnomaly := "Multi_Host_Volume_Anomaly";
+    (Recent24hIPs > 15) | BehavioralAnomaly := "Excessive_Geographic_Mobility";
+    * | BehavioralAnomaly := "General_Behavioral_Travel_Anomaly";
+}
+| stats(max(MLBehavioralScore, as=MaxBehavioralScore),
+        max(Recent24hIPs, as=MaxRecentIPs)) by [UserName, BehavioralAnomaly, CurrentLocationContext]
+| sort(MaxBehavioralScore, order=desc)
+Técnica Exclusiva: Machine learning behavioral baseline com scoring estatístico de desvios geográficos.
+
+5. Impossible Travel com Correlação de Malware
+fql
+#event_simpleName=UserLogon
+| LogonResult="Success"
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*powershell.*-enc.*|.*cmd.*\/c.*echo.*|.*rundll32.*javascript/i OR
+       FileName=/.*temp.*\.exe|.*tmp.*\.exe/i)
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, start=-1800s, end=+1800s, include=[CommandLine, FileName, MD5HashData])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [80, 443, 8080, 4444, 9999] // Malware C2 ports
+}, field=aid, key=aid, mode=inner, start=-600s, end=+600s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult="Success"
+    | stats(collect([SourceIP, @timestamp], limit=20) as RecentLogons) by UserName
+}, field=UserName, key=UserName, mode=inner, include=[RecentLogons])
+| eval(MalwareIndicators=0)
+| eval(MalwareIndicators=if(CommandLine=/.*-enc.*-nop/i, MalwareIndicators+3, MalwareIndicators))
+| eval(MalwareIndicators=if(RemotePort in [4444, 9999], MalwareIndicators+2, MalwareIndicators))
+| eval(MalwareIndicators=if(FileName=/.*temp.*\.exe/i, MalwareIndicators+1, MalwareIndicators))
+| eval(GeographicJump=false)
+| eval(PreviousIP=mvindex(RecentLogons, -2)) // Second to last IP
+| eval(GeographicJump=if(SourceIP!=PreviousIP AND SourceIP!=/^(10\.|172\.|192\.168\.)/, true, false))
+| eval(TravelMalwareScore=MalwareIndicators + if(GeographicJump=true, 3, 0))
+| TravelMalwareScore >= 5
+| eval(ThreatGeography=case([
+    SourceIP=/^(200\.|201\.|186\.|189\.)/i | "Brazil_Compromised_Host";
+    SourceIP=/^(177\.|179\.|181\.)/i | "Brazil_Secondary_Compromised";
+    SourceIP=/^(190\.|191\.)/i | "Latin_America_Compromised";
+    * | "International_Compromised_Host";
+]))
+| case {
+    (CommandLine=/.*-enc.*-nop/i AND GeographicJump=true) | TravelThreat := "Malware_Geographic_Jump";
+    (RemotePort in [4444, 9999] AND ThreatGeography!="Brazil_Compromised_Host") | TravelThreat := "C2_International_Travel";
+    (MD5HashData!="" AND GeographicJump=true) | TravelThreat := "Known_Hash_Travel_Anomaly";
+    * | TravelThreat := "Generic_Malware_Travel_Pattern";
+}
+| stats(max(TravelMalwareScore, as=MaxThreatScore),
+        count(as=MalwareTravelEvents)) by [UserName, TravelThreat, ThreatGeography]
+| sort(MaxThreatScore, order=desc)
+Técnica Exclusiva: Correlação de impossible travel com atividade de malware e C2 communication.
+
+6. Corporate Network Travel Detection
+fql
+#event_simpleName=UserLogon
+| LogonType="3" // Network logon
+| SourceIP=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | LocalAddressIP4=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=aid, key=aid, mode=inner, start=-300s, end=+300s, include=[LocalAddressIP4, RemoteAddressIP4])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*net.*use.*\\\\|.*psexec.*\\\\|.*wmic.*\/node/i OR
+       FileName=/.*psexec\.exe|.*paexec\.exe/i)
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, start=-120s, end=+300s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonType="3"
+    | stats(dc(SourceIP, as=NetworkLogonIPs),
+            dc(ComputerName, as=NetworkLogonHosts),
+            collect([SourceIP, ComputerName], limit=50) as NetworkHistory) by UserName
+}, field=UserName, key=UserName, mode=inner, include=[NetworkLogonIPs, NetworkLogonHosts, NetworkHistory])
+| regex("(?P<SourceSubnet>\\b(?P<Octet1>\\d{1,3})\\.(?P<Octet2>\\d{1,3})\\.(?P<Octet3>\\d{1,3})\\.", field=SourceIP)
+| regex("(?P<TargetSubnet>\\b(?P<TOctet1>\\d{1,3})\\.(?P<TOctet2>\\d{1,3})\\.(?P<TOctet3>\\d{1,3})\\.", field=RemoteAddressIP4)
+| eval(SubnetJump=if(SourceSubnet!=TargetSubnet, true, false))
+| eval(InternalTravelScore=0)
+| eval(InternalTravelScore=if(SubnetJump=true, InternalTravelScore+2, InternalTravelScore))
+| eval(InternalTravelScore=if(NetworkLogonHosts > 10, InternalTravelScore+2, InternalTravelScore))
+| eval(InternalTravelScore=if(CommandLine=/.*psexec.*\\\\|.*wmic.*\/node/i, InternalTravelScore+3, InternalTravelScore))
+| eval(InternalTravelScore=if(SourceIP not in (NetworkHistory), InternalTravelScore+2, InternalTravelScore))
+| InternalTravelScore >= 5
+| case {
+    (CommandLine=/.*psexec.*\\\\/ AND SubnetJump=true) | InternalMovement := "PsExec_Cross_Subnet_Movement";
+    (CommandLine=/.*wmic.*\/node/ AND NetworkLogonHosts > 15) | InternalMovement := "WMI_Extensive_Network_Access";
+    (SourceIP not in (NetworkHistory) AND SubnetJump=true) | InternalMovement := "New_Source_Cross_Subnet";
+    * | InternalMovement := "Generic_Internal_Network_Travel";
+}
+| eval(CorporateNetworkContext=case([
+    (Octet1="10" AND Octet2="0") | "Corporate_Main_Network";
+    (Octet1="172" AND Octet2 between ("16", "31")) | "Corporate_Secondary_Network";
+    (Octet1="192" AND Octet2="168") | "Branch_Office_Network";
+    * | "Unknown_Internal_Network";
+]))
+| stats(max(InternalTravelScore, as=MaxInternalScore),
+        max(NetworkLogonHosts, as=MaxNetworkHosts)) by [UserName, InternalMovement, CorporateNetworkContext]
+| sort(MaxInternalScore, order=desc)
+Técnica Exclusiva: Detecção de movimento lateral interno com analysis de subnet jumping e network enumeration.
+
+7. Time-based Impossible Travel with Brazilian Business Context
+fql
+#event_simpleName=UserLogon
+| LogonResult="Success"
+| join(query={
+    #event_simpleName=UserLogon  
+    | LogonResult="Success"
+    | stats(collect([@timestamp, SourceIP, ComputerName], limit=100) as LogonTimeline) by UserName
+}, field=UserName, key=UserName, mode=inner, include=[LogonTimeline])
+| eval(PreviousLogon=mvindex(LogonTimeline, -2)) // Previous logon
+| eval(PreviousIP=mvindex(split(PreviousLogon, ","), 1))
+| eval(PreviousTime=mvindex(split(PreviousLogon, ","), 0))
+| eval(TimeDelta=(@timestamp - tonumber(PreviousTime)) / 60000) // Minutes between logons
+| SourceIP != PreviousIP
+| eval(BrazilianTimeZone=case([
+    (Time between ("08:00", "12:00")) | "Morning_Business_Hours";
+    (Time between ("12:00", "14:00")) | "Lunch_Hour";
+    (Time between ("14:00", "18:00")) | "Afternoon_Business_Hours";
+    (Time between ("18:01", "22:00")) | "Evening_Hours";
+    (Time between ("22:01", "07:59")) | "Night_Hours";
+    * | "Unknown_Time";
+]))
+| eval(WorkdayContext=case([
+    dayOfWeek() between (1, 5) | "Weekday";
+    dayOfWeek() in [6, 7] | "Weekend";
+    * | "Unknown_Day";
+]))
+| eval(GeographicContext=case([
+    (PreviousIP=/^(200\.|201\.|186\.|189\.)/ AND SourceIP=/^(190\.|191\.)/) | "Brazil_to_Argentina_Travel";
+    (PreviousIP=/^(10\.|172\.|192\.168\.)/ AND SourceIP!=/^(10\.|172\.|192\.168\.)/) | "Internal_to_External_Travel";
+    (PreviousIP=/^(200\.|201\.)/ AND SourceIP!=/^(200\.|201\.|177\.|179\.|181\.|186\.|189\.)/) | "Brazil_to_International_Travel";
+    * | "Generic_Geographic_Change";
+]))
+| eval(BusinessHoursTravelScore=case([
+    (BrazilianTimeZone="Lunch_Hour" AND TimeDelta < 30) | 4; // Travel during lunch <30min
+    (BrazilianTimeZone="Night_Hours" AND GeographicContext="Brazil_to_International_Travel") | 5; // Night international travel
+    (WorkdayContext="Weekend" AND TimeDelta < 60) | 3; // Weekend rapid travel
+    (BrazilianTimeZone="Morning_Business_Hours" AND TimeDelta < 120) | 2; // Morning travel <2h
+    * | 1;
+]))
+| BusinessHoursTravelScore >= 3
+| case {
+    (BrazilianTimeZone="Lunch_Hour" AND TimeDelta < 30) | TravelTiming := "Lunch_Hour_Impossible_Travel";
+    (BrazilianTimeZone="Night_Hours" AND GeographicContext="Brazil_to_International_Travel") | TravelTiming := "Night_International_Travel";
+    (WorkdayContext="Weekend" AND GeographicContext!="Generic_Geographic_Change") | TravelTiming := "Weekend_Geographic_Anomaly";
+    * | TravelTiming := "Business_Hours_Travel_Anomaly";
+}
+| eval(TravelVelocity=if(TimeDelta > 0, round(1000 / TimeDelta, 2), 0)) // Rough velocity indicator
+| stats(max(BusinessHoursTravelScore, as=MaxBusinessScore),
+        min(TimeDelta, as=MinTravelTime),
+        max(TravelVelocity, as=MaxVelocity)) by [UserName, TravelTiming, GeographicContext]
+| sort(MaxBusinessScore, order=desc)
+Técnica Exclusiva: Análise temporal contextualizada com horários comerciais brasileiros e padrões culturais.
+
+8. Credential Theft Travel Pattern
+fql
+#event_simpleName=UserLogon
+| LogonResult="Success"
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*mimikatz|.*procdump|.*lsass|.*comsvcs\.dll/i OR
+       FileName=/.*mimikatz.*\.exe|.*procdump.*\.exe/i)
+}, field=aid, key=aid, mode=left, start=-3600s, end=+600s, include=[CommandLine, FileName, MD5HashData])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult in ["Failed", "Failure"]
+    | stats(count(as=FailedAttempts), 
+            collect([SourceIP, @timestamp], limit=20) as FailedHistory) by UserName
+}, field=UserName, key=UserName, mode=left, include=[FailedAttempts, FailedHistory])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*net.*user.*\/add|.*net.*group.*admin.*\/add|.*dsadd.*user/i // Privilege escalation
+}, field=[aid, UserName], key=[aid, UserName], mode=left, start=+300s, end=+1800s, include=[CommandLine], suffix="_escalation")
+| eval(CredentialTheftIndicators=0)
+| eval(CredentialTheftIndicators=if(CommandLine=/.*mimikatz|.*lsass/i, CredentialTheftIndicators+4, CredentialTheftIndicators))
+| eval(CredentialTheftIndicators=if(FailedAttempts > 5, CredentialTheftIndicators+2, CredentialTheftIndicators))
+| eval(CredentialTheftIndicators=if(CommandLine_escalation!="", CredentialTheftIndicators+3, CredentialTheftIndicators))
+| eval(PreviousFailedIP=mvindex(FailedHistory, -1))
+| eval(FailedToSuccessTravel=if(SourceIP!=PreviousFailedIP AND PreviousFailedIP!="", true, false))
+| eval(TheftTravelScore=CredentialTheftIndicators + if(FailedToSuccessTravel=true, 3, 0))
+| TheftTravelScore >= 6
+| eval(AttackGeography=case([
+    SourceIP=/^(200\.|201\.|186\.|189\.)/i | "Brazil_Credential_Attack";
+    SourceIP=/^(190\.|191\.)/i | "Latin_America_Credential_Attack";
+    SourceIP=/^(10\.|172\.|192\.168\.)/i | "Internal_Credential_Attack";
+    * | "International_Credential_Attack";
+]))
+| case {
+    (CommandLine=/.*mimikatz/i AND FailedToSuccessTravel=true) | TheftPattern := "Mimikatz_Travel_Success";
+    (FailedAttempts > 10 AND CommandLine_escalation!="") | TheftPattern := "Brute_Force_to_Escalation";
+    (CommandLine=/.*lsass/i AND AttackGeography="Internal_Credential_Attack") | TheftPattern := "Internal_Credential_Dump_Travel";
+    * | TheftPattern := "Generic_Credential_Theft_Travel";
+}
+| stats(max(TheftTravelScore, as=MaxTheftScore),
+        max(FailedAttempts, as=MaxFailedAttempts)) by [UserName, TheftPattern, AttackGeography]
+| sort(MaxTheftScore, order=desc)
+Técnica Exclusiva: Correlação de credential theft tools com impossible travel e privilege escalation.
+
+9. Multi-Factor Authentication Bypass Travel
+fql
+#event_simpleName=UserLogon
+| LogonResult="Success"
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*token.*bypass|.*mfa.*bypass|.*2fa.*bypass|.*authenticator/i OR
+       FileName=/.*auth.*bypass.*|.*token.*steal.*|.*sms.*intercept.*/i)
+}, field=[aid, UserName], key=[aid, UserName], mode=left, start=-1800s, end=+600s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemotePort in [25, 587, 993, 995, 80, 443] AND
+       RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/)
+}, field=aid, key=aid, mode=left, start=-900s, end=+900s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult="Success"
+    | stats(dc(SourceIP, as=RecentIPCount),
+            collect([SourceIP, @timestamp], limit=10) as RecentIPs) by UserName
+}, field=UserName, key=UserName, mode=inner, include=[RecentIPCount, RecentIPs])
+| eval(MFABypassIndicators=0)
+| eval(MFABypassIndicators=if(CommandLine=/.*token.*bypass|.*mfa.*bypass/i, MFABypassIndicators+4, MFABypassIndicators))
+| eval(MFABypassIndicators=if(FileName!="", MFABypassIndicators+3, MFABypassIndicators))
+| eval(MFABypassIndicators=if(RemotePort in [25, 587], MFABypassIndicators+2, MFABypassIndicators)) // Email access
+| eval(NewLocationLogon=if(SourceIP not in (RecentIPs), true, false))
+| eval(RapidLocationChange=false)
+| eval(LastLogonTime=mvindex(RecentIPs, -1))
+| eval(TimeSinceLastLogon=(@timestamp - tonumber(LastLogonTime)) / 60000)
+| eval(RapidLocationChange=if(NewLocationLogon=true AND TimeSinceLastLogon < 60, true, false))
+| eval(MFABypassTravelScore=MFABypassIndicators + if(RapidLocationChange=true, 4, 0) + if(NewLocationLogon=true, 2, 0))
+| MFABypassTravelScore >= 7
+| eval(BypassGeography=case([
+    SourceIP=/^(200\.|201\.|186\.|189\.)/i | "Brazil_MFA_Bypass";
+    SourceIP=/^(177\.|179\.|181\.)/i | "Brazil_Secondary_MFA_Bypass";
+    SourceIP=/^(10\.|172\.|192\.168\.)/i | "Internal_MFA_Bypass";
+    * | "International_MFA_Bypass";
+]))
+| case {
+    (CommandLine=/.*token.*bypass/i AND RapidLocationChange=true) | BypassMethod := "Token_Bypass_Rapid_Travel";
+    (RemotePort in [25, 587] AND NewLocationLogon=true) | BypassMethod := "Email_Access_New_Location";
+    (CommandLine=/.*authenticator/i) | BypassMethod := "Authenticator_App_Compromise";
+    * | BypassMethod := "Generic_MFA_Bypass_Travel";
+}
+| stats(max(MFABypassTravelScore, as=MaxBypassScore),
+        min(TimeSinceLastLogon, as=MinTimeBetweenLogons)) by [UserName, BypassMethod, BypassGeography]
+| sort(MaxBypassScore, order=desc)
+Técnica Exclusiva: Detecção de bypass de MFA correlacionado com impossible travel patterns.
+
+10. Advanced Persistence Travel Detection
+fql
+#event_simpleName=UserLogon
+| LogonResult="Success"
+| join(query={
+    (#event_simpleName=AsepValueUpdate OR #event_simpleName=ServiceInstalled OR #event_simpleName=ScheduledTaskRegistered)
+}, field=aid, key=aid, mode=inner, start=-3600s, end=+3600s, include=[ServiceName, ValueData, TaskName])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*schtasks.*\/create|.*sc.*create|.*reg.*add.*run/i OR
+       FileName=/.*at\.exe|.*schtasks\.exe|.*sc\.exe/i)
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, start=-1800s, end=+1800s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult="Success"
+    | stats(collect([SourceIP, @timestamp, ComputerName], limit=20) as LogonPattern) by UserName
+}, field=UserName, key=UserName, mode=inner, include=[LogonPattern])
+| eval(PersistenceIndicators=0)
+| eval(PersistenceIndicators=if(CommandLine=/.*schtasks.*\/create/i, PersistenceIndicators+3, PersistenceIndicators))
+| eval(PersistenceIndicators=if(ServiceName!="", PersistenceIndicators+3, PersistenceIndicators))
+| eval(PersistenceIndicators=if(ValueData=/.*powershell.*-enc/i, PersistenceIndicators+4, PersistenceIndicators))
+| eval(PersistenceIndicators=if(TaskName!="", PersistenceIndicators+2, PersistenceIndicators))
+| eval(TravelAfterPersistence=false)
+| eval(PreviousLogon=mvindex(LogonPattern, -2))
+| eval(PreviousIP=mvindex(split(PreviousLogon, ","), 0))
+| eval(PreviousHost=mvindex(split(PreviousLogon, ","), 2))
+| eval(TravelAfterPersistence=if(SourceIP!=PreviousIP AND ComputerName!=PreviousHost, true, false))
+| eval(PersistenceTravelScore=PersistenceIndicators + if(TravelAfterPersistence=true, 3, 0))
+| PersistenceTravelScore >= 7
+| eval(PersistenceGeography=case([
+    SourceIP=/^(200\.|201\.|186\.|189\.)/i | "Brazil_Persistence_Travel";
+    SourceIP=/^(177\.|179\.|181\.)/i | "Brazil_Secondary_Persistence";
+    SourceIP=/^(10\.|172\.|192\.168\.)/i | "Internal_Persistence_Travel";
+    * | "International_Persistence_Travel";
+]))
+| case {
+    (ValueData=/.*powershell.*-enc/i AND TravelAfterPersistence=true) | PersistenceType := "Encoded_PowerShell_Persistence_Travel";
+    (ServiceName!="" AND TravelAfterPersistence=true) | PersistenceType := "Service_Installation_Travel";
+    (TaskName!="" AND PersistenceGeography="Brazil_Persistence_Travel") | PersistenceType := "Scheduled_Task_Brazilian_Travel";
+    * | PersistenceType := "Generic_Persistence_Travel";
+}
+| stats(max(PersistenceTravelScore, as=MaxPersistenceScore),
+        count(as=PersistenceEvents)) by [UserName, PersistenceType, PersistenceGeography]
+| sort(MaxPersistenceScore, order=desc)
+Técnica Exclusiva: Correlação de estabelecimento de persistência com impossible travel para detectar APTs móveis.
