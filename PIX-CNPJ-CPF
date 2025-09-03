@@ -1,0 +1,230 @@
+1. Detecção de Exfiltração de CPF/CNPJ em Massa
+fql
+#event_simpleName=ProcessRollup2 OR #event_simpleName=FileWritten
+| regex("(?P<CPF>\\b\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2}\\b|\\b\\d{11}\\b)", field=CommandLine, strict=false)
+| regex("(?P<CNPJ>\\b\\d{2}\\.\\d{3}\\.\\d{3}/\\d{4}-\\d{2}\\b|\\b\\d{14}\\b)", field=CommandLine, strict=false)
+| (CPF!="" OR CNPJ!="")
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [21, 22, 80, 443, 25, 587]
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, start=-1m, end=+5m)
+| eval(DocumentType=case([
+    CPF!="" AND CNPJ!="" | "CPF_CNPJ_Mixed";
+    CPF!="" | "CPF_Only";
+    CNPJ!="" | "CNPJ_Only";
+]))
+| stats(count(as=ExfiltrationAttempts), dc(RemoteAddressIP4, as=UniqueDestinations), 
+        collect([CPF, CNPJ], limit=10) as SampleDocs) by [aid, UserName, DocumentType]
+| ExfiltrationAttempts > 5
+| sort(ExfiltrationAttempts, order=desc)
+Propósito: Detecta vazamento em massa de documentos brasileiros (CPF/CNPJ) com transferência externa.
+
+2. Monitoramento de Transações PIX Suspeitas
+fql
+#event_simpleName=ProcessRollup2 OR #event_simpleName=NetworkConnectIP4
+| regex("(?i)(?P<PIXData>pix|chave\\s*pix|qr\\s*code|transferencia\\s*instantanea)", field=CommandLine, strict=false)
+| regex("(?P<BankAccount>\\b\\d{4,5}-\\d{1}\\b|\\b\\d{4,6}\\s*-\\s*\\d{1,2}\\b)", field=CommandLine, strict=false)
+| regex("(?P<CPFInTransaction>\\b\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2}\\b)", field=CommandLine, strict=false)
+| regex("(?P<MonetaryValue>R\\$\\s*[\\d,]+\\.\\d{2}|\\b\\d{1,3}(?:\\.\\d{3})*,\\d{2}\\b)", field=CommandLine, strict=false)
+| (PIXData!="" OR BankAccount!="" OR MonetaryValue!="")
+| case {
+    (ComputerName!=/.*workstation.*|.*desktop.*|.*laptop.*/i AND PIXData!="") | RiskLevel := "PIX_Server_Unusual";
+    (MonetaryValue!="" AND regex("(?P<HighValue>\\b(?:[5-9]\\d{4,}|[1-9]\\d{5,})\\b", field=MonetaryValue)) | RiskLevel := "High_Value_Transaction";
+    (Time>now()-300000 AND PIXData!="") | RiskLevel := "Recent_PIX_Activity";
+    * | RiskLevel := "Standard_Financial";
+}
+| stats(count(as=TransactionCount), collect([MonetaryValue, BankAccount], limit=5) as TransactionDetails) by [aid, UserName, RiskLevel]
+| sort(TransactionCount, order=desc)
+Propósito: Monitora atividades suspeitas relacionadas ao PIX e transferências bancárias brasileiras.
+
+3. Detecção de Banking Trojans Brasileiros
+fql
+#event_simpleName=ProcessRollup2
+| (FileName=/.*\.exe$/i AND CommandLine=/.*banco.*brasil|.*bradesco|.*itau|.*santander|.*caixa/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner)
+| join(query={
+    #event_simpleName=DNSRequest
+    | DomainName=/.*(bb\.com\.br|bradesco\.com\.br|itau\.com\.br|santander\.com\.br|caixa\.gov\.br).*/i
+}, field=aid, key=aid, mode=left, include=[DomainName])
+| case {
+    (CommandLine=/.*agencia|.*conta.*corrente|.*cartao.*credito/i AND DomainName="") | ThreatType := "Banking_Phishing_Local";
+    (RemoteAddressIP4!="" AND DomainName!="") | ThreatType := "Legitimate_Banking_Access";
+    (RemoteAddressIP4!="" AND DomainName="") | ThreatType := "Suspicious_Banking_Connection";
+    * | ThreatType := "Unknown_Banking_Activity";
+}
+| ThreatType!="Legitimate_Banking_Access"
+| stats(count(as=BankingAttempts), dc(RemoteAddressIP4, as=UniqueIPs)) by [aid, UserName, ThreatType]
+| sort(BankingAttempts, order=desc)
+Propósito: Identifica malware bancário direcionado a instituições financeiras brasileiras.
+
+4. Vazamento de Dados Bancários e Cartões de Crédito
+fql
+#event_simpleName=FileWritten OR #event_simpleName=ProcessRollup2
+| regex("(?P<CreditCard>\\b(?:4\\d{3}|5[1-5]\\d{2}|6011|3[47]\\d{2})[-\\s]?\\d{4}[-\\s]?\\d{4}[-\\s]?\\d{4}\\b)", field=CommandLine, strict=false)
+| regex("(?P<BankBranch>\\b\\d{4}-\\d{1}\\b|\\bagencia\\s*\\d{4,5}\\b)", field=CommandLine, strict=false)
+| regex("(?P<BankAccount>\\b\\d{6,12}-\\d{1}\\b|\\bconta\\s*\\d{6,12}\\b)", field=CommandLine, strict=false)
+| regex("(?P<RoutingCode>\\b\\d{3}\\b.*\\bbanco\\b)", field=CommandLine, strict=false)
+| (CreditCard!="" OR BankBranch!="" OR BankAccount!="" OR RoutingCode!="")
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemotePort in [21, 22, 25, 80, 443, 587, 993, 995]
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=aid, key=aid, mode=inner, start=-2m, end=+2m, include=[RemoteAddressIP4, RemotePort])
+| eval(DataSensitivity=0)
+| eval(DataSensitivity=if(CreditCard!="", DataSensitivity+3, DataSensitivity))
+| eval(DataSensitivity=if(BankBranch!="" AND BankAccount!="", DataSensitivity+2, DataSensitivity))
+| eval(DataSensitivity=if(RoutingCode!="", DataSensitivity+1, DataSensitivity))
+| DataSensitivity >= 2
+| stats(max(DataSensitivity, as=MaxSensitivity), dc(RemoteAddressIP4, as=Destinations), 
+        count(as=LeakageEvents)) by [aid, UserName]
+| sort(MaxSensitivity, order=desc)
+Propósito: Detecta vazamento de dados financeiros sensíveis do sistema bancário brasileiro.
+
+5. Monitoramento de Acesso a Sistemas SIPAG/SPB
+fql
+#event_simpleName=ProcessRollup2 OR #event_simpleName=NetworkConnectIP4
+| regex("(?i)(?P<FinancialSystem>sipag|spb|bacen|cip|sitraf|selic|str)", field=CommandLine, strict=false)
+| regex("(?P<BankCode>\\b(?:001|033|104|237|341|356|389|422|070|077|756)\\b)", field=CommandLine, strict=false)
+| (FinancialSystem!="" OR BankCode!="")
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonType in ["2", "3", "10"]
+}, field=aid, key=aid, mode=inner, start=-10m, end=+1m, include=[UserName, LogonType])
+| case {
+    (Time between ("08:00", "18:00") AND FinancialSystem!="") | AccessPattern := "Business_Hours_Financial";
+    (Time not between ("06:00", "22:00") AND FinancialSystem!="") | AccessPattern := "After_Hours_Financial";
+    (BankCode!="" AND LogonType="3") | AccessPattern := "Network_Banking_Access";
+    * | AccessPattern := "Standard_Access";
+}
+| AccessPattern!="Business_Hours_Financial"
+| stats(count(as=AccessCount), dc(UserName, as=UniqueUsers)) by [AccessPattern, FinancialSystem, BankCode]
+| sort(AccessCount, order=desc)
+Propósito: Monitora acessos suspeitos aos sistemas de pagamento brasileiros (SIPAG/SPB).
+
+6. Detecção de Boletos Bancários Fraudulentos
+fql
+#event_simpleName=ProcessRollup2 OR #event_simpleName=FileWritten
+| regex("(?P<BoletoCode>\\b\\d{5}\\.\\d{5}\\s+\\d{5}\\.\\d{6}\\s+\\d{5}\\.\\d{6}\\s+\\d{1}\\s+\\d{14}\\b)", field=CommandLine, strict=false)
+| regex("(?P<BoletoBarcode>\\b\\d{47,48}\\b)", field=CommandLine, strict=false)
+| regex("(?P<BoletoValue>R\\$\\s*[\\d,]+\\.\\d{2})", field=CommandLine, strict=false)
+| (BoletoCode!="" OR BoletoBarcode!="" OR BoletoValue!="")
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (FileName=/.*pdf.*|.*excel.*|.*word.*/i OR CommandLine=/.*\.pdf|.*\.xls|.*\.doc/i)
+}, field=aid, key=aid, mode=inner, start=-5m, end=+5m, include=[FileName])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemotePort in [25, 587, 80, 443]
+}, field=aid, key=aid, mode=left, start=+1m, end=+10m, include=[RemoteAddressIP4])
+| eval(FraudRisk=case([
+    (BoletoValue!="" AND regex("R\\$\\s*(?:[5-9]\\d{3,}|[1-9]\\d{4,})", field=BoletoValue)) | 3;
+    (RemoteAddressIP4!="" AND BoletoCode!="") | 2;
+    (FileName!="" AND BoletoBarcode!="") | 2;
+    * | 1;
+]))
+| FraudRisk >= 2
+| stats(max(FraudRisk, as=MaxRisk), count(as=BoletoActivity)) by [aid, UserName, BoletoValue]
+| sort(MaxRisk, order=desc)
+Propósito: Identifica criação e distribuição de boletos bancários potencialmente fraudulentos.
+
+7. Monitoramento de Dados da Receita Federal
+fql
+#event_simpleName=FileWritten OR #event_simpleName=ProcessRollup2
+| regex("(?P<CNAE>\\b\\d{4}-\\d{1}/\\d{2}\\b)", field=CommandLine, strict=false)
+| regex("(?P<InscricaoEstadual>\\b\\d{3}\\.\\d{3}\\.\\d{3}\\.\\d{3}\\b|\\b\\d{12}\\b)", field=CommandLine, strict=false)
+| regex("(?P<TituloEleitor>\\b\\d{4}\\s+\\d{4}\\s+\\d{4}\\b)", field=CommandLine, strict=false)
+| regex("(?i)(?P<ReceitaData>receita\\s*federal|cpf|cnpj|imposto\\s*renda|declaracao|irpf)", field=CommandLine, strict=false)
+| (CNAE!="" OR InscricaoEstadual!="" OR TituloEleitor!="" OR ReceitaData!="")
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=aid, key=aid, mode=inner, start=-1m, end=+5m, include=[RemoteAddressIP4, RemotePort])
+| case {
+    (CNAE!="" AND InscricaoEstadual!="") | DataType := "Business_Tax_Data";
+    (TituloEleitor!="") | DataType := "Electoral_Data";
+    (ReceitaData!="") | DataType := "Tax_Authority_Data";
+    * | DataType := "General_Financial_Data";
+}
+| stats(count(as=DataLeakEvents), dc(RemoteAddressIP4, as=Destinations)) by [aid, UserName, DataType]
+| sort(DataLeakEvents, order=desc)
+Propósito: Detecta vazamento de dados fiscais e da Receita Federal brasileira.
+
+8. Detecção de Fraude em Cartões Pré-pagos e Vale-transporte
+fql
+#event_simpleName=ProcessRollup2
+| regex("(?P<ValeTransporte>\\b\\d{16}\\b.*(?:vale|transport|metro|onibus)", field=CommandLine, strict=false)
+| regex("(?P<PrePaidCard>\\b\\d{16}\\b.*(?:prepago|pre.*pago|cartao.*presente)", field=CommandLine, strict=false)
+| regex("(?P<BilheteUnico>\\b\\d{10,12}\\b.*(?:bilhete|unico|sptrans)", field=CommandLine, strict=false)
+| (ValeTransporte!="" OR PrePaidCard!="" OR BilheteUnico!="")
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemotePort in [80, 443, 8080, 8443]
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*clone|.*copy|.*duplicate|.*generate/i
+}, field=aid, key=aid, mode=left, start=-2m, end=+2m, include=[CommandLine])
+| eval(FraudType=case([
+    (ValeTransporte!="" AND CommandLine=/.*clone|.*copy/i) | "Transport_Card_Cloning";
+    (PrePaidCard!="" AND CommandLine=/.*generate/i) | "PrePaid_Card_Generation";
+    (BilheteUnico!="" AND RemoteAddressIP4!="") | "Transit_Card_Network_Activity";
+    * | "Unknown_Card_Activity";
+]))
+| stats(count(as=FraudAttempts), dc(RemoteAddressIP4, as=NetworkConnections)) by [aid, UserName, FraudType]
+| sort(FraudAttempts, order=desc)
+Propósito: Identifica fraudes relacionadas a cartões pré-pagos e sistemas de transporte público.
+
+9. Vazamento de Dados do SUS/CNS (Sistema Único de Saúde)
+fql
+#event_simpleName=FileWritten OR #event_simpleName=ProcessRollup2
+| regex("(?P<CartaoSUS>\\b\\d{15}\\b|\\b\\d{3}\\s+\\d{4}\\s+\\d{4}\\s+\\d{4}\\b)", field=CommandLine, strict=false)
+| regex("(?i)(?P<SUSData>sus|cns|cartao.*saude|ministerio.*saude|datasus)", field=CommandLine, strict=false)
+| regex("(?P<CID>\\b[A-Z]\\d{2}\\.\\d\\b|\\b[A-Z]\\d{2}\\b)", field=CommandLine, strict=false)
+| regex("(?P<CNES>\\b\\d{7}\\b.*(?:cnes|estabelecimento)", field=CommandLine, strict=false)
+| (CartaoSUS!="" OR SUSData!="" OR CID!="" OR CNES!="")
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [21, 22, 25, 80, 443, 587]
+}, field=aid, key=aid, mode=inner, start=-2m, end=+5m, include=[RemoteAddressIP4, RemotePort])
+| eval(HealthDataSensitivity=0)
+| eval(HealthDataSensitivity=if(CartaoSUS!="", HealthDataSensitivity+3, HealthDataSensitivity))
+| eval(HealthDataSensitivity=if(CID!="", HealthDataSensitivity+2, HealthDataSensitivity))
+| eval(HealthDataSensitivity=if(CNES!="", HealthDataSensitivity+1, HealthDataSensitivity))
+| HealthDataSensitivity >= 2
+| stats(max(HealthDataSensitivity, as=MaxSensitivity), count(as=LeakageEvents), 
+        dc(RemoteAddressIP4, as=ExternalDestinations)) by [aid, UserName]
+| sort(MaxSensitivity, order=desc)
+Propósito: Detecta vazamento de dados sensíveis do sistema de saúde brasileiro.
+
+10. Detecção de Fraude em Open Banking Brasil
+fql
+#event_simpleName=NetworkConnectIP4 OR #event_simpleName=ProcessRollup2
+| regex("(?i)(?P<OpenBanking>open.*banking|pix.*api|banco.*central.*api|oauth.*bank)", field=CommandLine, strict=false)
+| regex("(?P<APIKey>\\b[A-Za-z0-9]{32,}\\b.*(?:key|token|auth)", field=CommandLine, strict=false)
+| regex("(?P<BankingScope>accounts|payments|customers|consents", field=CommandLine, strict=false)
+| (OpenBanking!="" OR APIKey!="" OR BankingScope!="")
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemotePort in [443, 8443]
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=aid, key=aid, mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*curl|.*wget|.*postman|.*python.*requests/i
+}, field=aid, key=aid, mode=left, start=-1m, end=+1m, include=[CommandLine])
+| case {
+    (APIKey!="" AND BankingScope!="") | ThreatLevel := "API_Key_With_Banking_Scope";
+    (OpenBanking!="" AND CommandLine=/.*curl|.*wget/i) | ThreatLevel := "Command_Line_Banking_API";
+    (BankingScope="payments" OR BankingScope="accounts") | ThreatLevel := "Sensitive_Banking_Scope";
+    * | ThreatLevel := "General_Banking_API";
+}
+| ThreatLevel!="General_Banking_API"
+| stats(count(as=APIUsage), dc(RemoteAddressIP4, as=UniqueEndpoints)) by [aid, UserName, ThreatLevel]
+| sort(APIUsage, order=desc)
+Propósito: Monitora uso suspeito de APIs do Open Banking brasileiro para detectar fraudes.
+
