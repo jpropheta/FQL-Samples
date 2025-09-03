@@ -1,0 +1,416 @@
+1. User Behavioral Baseline Deviation Detection
+fql
+#event_simpleName=UserLogon
+| LogonType in ["2", "3", "10"]
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | stats(count(as=HistoricalProcessCount), 
+            dc(FileName, as=HistoricalUniqueProcesses),
+            collect(FileName, limit=20) as HistoricalProcesses) by [aid, UserName]
+    | timechart(span=7d, function=[avg(HistoricalProcessCount, as=AvgProcesses), 
+                                  avg(HistoricalUniqueProcesses, as=AvgUniqueProcesses)]) by UserName
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, include=[AvgProcesses, AvgUniqueProcesses])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | groupBy([aid, UserName], function=[count(as=CurrentProcessCount), 
+                                       dc(FileName, as=CurrentUniqueProcesses)])
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, include=[CurrentProcessCount, CurrentUniqueProcesses])
+| eval(ProcessDeviationScore=case([
+    (CurrentProcessCount > (AvgProcesses * 3)) | 4; // 3x more processes than average
+    (CurrentUniqueProcesses > (AvgUniqueProcesses * 2)) | 3; // 2x more unique processes
+    (CurrentProcessCount > (AvgProcesses * 2)) | 2; // 2x more processes
+    * | 1;
+]))
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | stats(dc(RemoteAddressIP4, as=ExternalConnections)) by [aid, UserName]
+}, field=[aid, UserName], key=[aid, UserName], mode=left, include=[ExternalConnections])
+| eval(BehavioralAnomalyScore=ProcessDeviationScore)
+| eval(BehavioralAnomalyScore=if(ExternalConnections > 5, BehavioralAnomalyScore+2, BehavioralAnomalyScore))
+| eval(BrazilianBusinessContext=case([
+    (Time between ("12:00", "14:00")) | "Lunch_Hour_Activity";
+    (Time not between ("08:00", "18:00") OR dayOfWeek() in [6, 7]) | "After_Hours_Weekend";
+    * | "Business_Hours";
+]))
+| BehavioralAnomalyScore >= 4
+| stats(max(BehavioralAnomalyScore, as=MaxAnomalyScore), 
+        max(ProcessDeviationScore, as=MaxProcessDeviation)) by [aid, UserName, BrazilianBusinessContext]
+| sort(MaxAnomalyScore, order=desc)
+Detecção Exclusiva: Baseline comportamental histórico por usuário com desvios estatísticos em tempo real.
+
+2. Credential Stuffing & Password Spray Detection
+fql
+#event_simpleName=UserLogon
+| LogonResult in ["Failed", "Failure"]
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult in ["Failed", "Failure"]
+    | stats(count(as=FailedAttempts), dc(UserName, as=UniqueUsers), 
+            dc(ComputerName, as=UniqueHosts)) by [aid, SourceIP]
+    | FailedAttempts > 10 AND UniqueUsers > 5
+}, field=[aid, SourceIP], key=[aid, SourceIP], mode=inner, include=[FailedAttempts, UniqueUsers, UniqueHosts])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult="Success"
+}, field=[aid, UserName], key=[aid, UserName], mode=left, start=+1m, end=+60m, include=[LogonResult, ComputerName], suffix="_success")
+| case {
+    (FailedAttempts > 50 AND UniqueUsers > 20) | AttackType := "Large_Scale_Password_Spray";
+    (FailedAttempts > 100 AND UniqueUsers < 10) | AttackType := "Credential_Stuffing_Attack";
+    (UniqueHosts > 10 AND FailedAttempts > 20) | AttackType := "Distributed_Brute_Force";
+    * | AttackType := "Targeted_Account_Attack";
+}
+| eval(AttackSeverity=case([
+    (LogonResult_success="Success" AND AttackType="Large_Scale_Password_Spray") | 5; // Successful spray
+    (FailedAttempts > 100) | 4; // High volume
+    (UniqueUsers > 50) | 3; // Wide targeting
+    * | 2;
+]))
+| eval(BrazilianIPContext=case([
+    SourceIP=/^(200\.|201\.|186\.|189\.)/i | "Brazilian_IP_Range";
+    SourceIP=/^(181\.|190\.|179\.)/i | "Latin_America_IP";
+    * | "International_IP";
+]))
+| AttackSeverity >= 3
+| stats(max(AttackSeverity, as=MaxSeverity), sum(FailedAttempts, as=TotalFailures), 
+        sum(UniqueUsers, as=TotalTargetedUsers)) by [SourceIP, AttackType, BrazilianIPContext]
+| sort(MaxSeverity, order=desc)
+Detecção Exclusiva: Correlação temporal de falhas e sucessos com análise geográfica para o Brasil.
+
+3. Insider Threat - Privilege Escalation Pattern
+fql
+#event_simpleName=UserLogon
+| UserName!=/.*admin.*|.*adm.*|.*service.*|.*system/i // Regular user account
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | TokenType="TokenElevationTypeFull"
+    | CommandLine=/.*runas.*|.*net.*localgroup.*admin|.*net.*user.*/i
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, start=-10m, end=+10m, include=[CommandLine, TokenType])
+| join(query={
+    #event_simpleName=AsepValueUpdate OR #event_simpleName=ServiceInstalled
+}, field=aid, key=aid, mode=left, start=+1m, end=+30m, include=[ServiceName, ValueData])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | stats(count(as=HistoricalAdminUsage)) by [aid, UserName]
+    | HistoricalAdminUsage < 3 // User rarely uses admin commands
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, include=[HistoricalAdminUsage])
+| eval(InsiderRiskScore=0)
+| eval(InsiderRiskScore=if(TokenType="TokenElevationTypeFull", InsiderRiskScore+3, InsiderRiskScore))
+| eval(InsiderRiskScore=if(CommandLine=/.*net.*localgroup.*admin/i, InsiderRiskScore+4, InsiderRiskScore))
+| eval(InsiderRiskScore=if(ServiceName!="" OR ValueData!="", InsiderRiskScore+2, InsiderRiskScore))
+| eval(InsiderRiskScore=if(HistoricalAdminUsage=0, InsiderRiskScore+2, InsiderRiskScore)) // Never used admin before
+| InsiderRiskScore >= 6
+| case {
+    (CommandLine=/.*net.*localgroup.*admin.*\/add/i) | ThreatPattern := "Admin_Group_Addition";
+    (ServiceName!="" AND TokenType="TokenElevationTypeFull") | ThreatPattern := "Service_Installation_Escalation";
+    (HistoricalAdminUsage=0 AND InsiderRiskScore >= 7) | ThreatPattern := "First_Time_Admin_Activity";
+    * | ThreatPattern := "General_Privilege_Escalation";
+}
+| eval(WorkContext=case([
+    (Time between ("18:01", "07:59") OR dayOfWeek() in [6, 7]) | "After_Hours_Escalation";
+    (Time between ("12:00", "14:00")) | "Lunch_Hour_Escalation";
+    * | "Business_Hours_Escalation";
+]))
+| stats(max(InsiderRiskScore, as=MaxRisk), count(as=EscalationEvents)) by [aid, UserName, ThreatPattern, WorkContext]
+| sort(MaxRisk, order=desc)
+Detecção Exclusiva: Behavioral baseline de uso administrativo histórico vs. atividade atual suspeita.
+
+4. Stolen Credentials - Geolocation & Time Anomalies
+fql
+#event_simpleName=UserLogon
+| LogonResult="Success"
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonResult="Success"
+    | stats(min(@timestamp, as=FirstLogon), max(@timestamp, as=LastLogon), 
+            dc(ComputerName, as=HistoricalHosts), 
+            collect(ComputerName, limit=10) as UsualHosts) by UserName
+    | eval(UsualLogonPattern=if(HistoricalHosts <= 3, "Single_Workstation_User", "Multi_Host_User"))
+}, field=UserName, key=UserName, mode=inner, include=[HistoricalHosts, UsualHosts, UsualLogonPattern])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | stats(dc(RemoteAddressIP4, as=NetworkConnections), 
+            collect(RemoteAddressIP4, limit=5) as RemoteIPs) by [aid, UserName]
+}, field=[aid, UserName], key=[aid, UserName], mode=left, include=[NetworkConnections, RemoteIPs])
+| eval(GeolocationAnomaly=case([
+    (ComputerName not in (UsualHosts) AND UsualLogonPattern="Single_Workstation_User") | 4; // New host for single-host user
+    (ComputerName not in (UsualHosts) AND HistoricalHosts > 5) | 2; // New host for multi-host user
+    * | 0;
+]))
+| eval(TimeAnomaly=case([
+    (Time between ("02:00", "05:00")) | 3; // Deep night logon
+    (Time between ("22:00", "06:00") AND dayOfWeek() between (1, 5)) | 2; // Late night weekday
+    (dayOfWeek() in [6, 7] AND Time between ("20:00", "08:00")) | 2; // Weekend night
+    * | 0;
+]))
+| eval(NetworkAnomaly=case([
+    (NetworkConnections > 20 AND UsualLogonPattern="Single_Workstation_User") | 2; // Unusual network activity
+    (NetworkConnections > 50) | 1; // High network activity
+    * | 0;
+]))
+| eval(StolenCredentialScore=GeolocationAnomaly + TimeAnomaly + NetworkAnomaly)
+| StolenCredentialScore >= 5
+| case {
+    (GeolocationAnomaly >= 3 AND TimeAnomaly >= 2) | CredentialTheftType := "Off_Hours_New_Location";
+    (NetworkAnomaly >= 2 AND GeolocationAnomaly >= 2) | CredentialTheftType := "New_Host_High_Network";
+    (TimeAnomaly >= 3) | CredentialTheftType := "Deep_Night_Access";
+    * | CredentialTheftType := "General_Anomalous_Access";
+}
+| stats(max(StolenCredentialScore, as=MaxScore), 
+        count(as=AnomalousLogons)) by [UserName, CredentialTheftType, ComputerName]
+| sort(MaxScore, order=desc)
+Detecção Exclusiva: Análise geográfica e temporal com baseline histórico de comportamento de logon.
+
+5. Data Exfiltration by Privileged Users
+fql
+#event_simpleName=UserLogon
+| UserName=/.*admin.*|.*adm.*|.*gerente.*|.*diretor.*|.*manager.*/i // Privileged accounts (Brazilian context)
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*xcopy.*\/s|.*robocopy.*\/e|.*powershell.*copy-item.*-recurse/i OR
+       FileName=/.*7z\.exe|.*winrar\.exe|.*zip\.exe/i)
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, start=+1m, end=+120m, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=FileWritten
+    | (FilePath=/.*\.zip$|.*\.rar$|.*\.7z$/i AND Size > 52428800) // Files > 50MB
+}, field=aid, key=aid, mode=inner, start=+30s, end=+300s, include=[FilePath, Size])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [21, 22, 25, 80, 443, 587]
+}, field=aid, key=aid, mode=inner, start=+60s, end=+600s, include=[RemoteAddressIP4, RemotePort])
+| eval(ExfiltrationRisk=0)
+| eval(ExfiltrationRisk=if(Size > 104857600, ExfiltrationRisk+4, ExfiltrationRisk)) // >100MB
+| eval(ExfiltrationRisk=if(RemotePort in [21, 22], ExfiltrationRisk+3, ExfiltrationRisk)) // FTP/SSH
+| eval(ExfiltrationRisk=if(CommandLine=/.*\/s|.*\/e|.*-recurse/i, ExfiltrationRisk+2, ExfiltrationRisk)) // Recursive copy
+| eval(ExfiltrationRisk=if(UserName=/.*admin.*|.*gerente.*/i, ExfiltrationRisk+2, ExfiltrationRisk)) // Privileged user
+| ExfiltrationRisk >= 6
+| eval(BrazilianWorkHours=case([
+    (Time between ("18:01", "07:59")) | "After_Business_Hours";
+    (Time between ("12:00", "14:00")) | "Lunch_Hour_Transfer";
+    (dayOfWeek() in [6, 7]) | "Weekend_Transfer";
+    * | "Business_Hours_Transfer";
+]))
+| case {
+    (RemotePort in [21, 22] AND Size > 104857600) | ExfiltrationType := "Large_File_FTP_Transfer";
+    (RemotePort in [25, 587] AND Size > 52428800) | ExfiltrationType := "Email_Exfiltration";
+    (CommandLine=/.*powershell.*copy-item/i) | ExfiltrationType := "PowerShell_Data_Copy";
+    * | ExfiltrationType := "Generic_Data_Exfiltration";
+}
+| eval(DataSizeMB=round(Size/1048576, 2))
+| stats(max(ExfiltrationRisk, as=MaxRisk), sum(DataSizeMB, as=TotalMB), 
+        dc(RemoteAddressIP4, as=UniqueDestinations)) by [UserName, ExfiltrationType, BrazilianWorkHours]
+| sort(MaxRisk, order=desc)
+Detecção Exclusiva: Correlação de privilégios, volume de dados e transferências externas com contexto brasileiro.
+
+6. Account Takeover - Behavioral Change Detection
+fql
+#event_simpleName=ProcessRollup2
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | timechart(span=30d, function=[dc(FileName, as=HistoricalUniqueProcesses), 
+                                   collect(FileName, limit=50) as HistoricalProcessList]) by UserName
+}, field=UserName, key=UserName, mode=inner, include=[HistoricalUniqueProcesses, HistoricalProcessList])
+| FileName not in (HistoricalProcessList) // Process never used by this user
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | stats(dc(RemoteAddressIP4, as=NewExternalConnections)) by [aid, UserName]
+}, field=[aid, UserName], key=[aid, UserName], mode=left, include=[NewExternalConnections])
+| join(query={
+    #event_simpleName=UserLogon
+    | stats(dc(ComputerName, as=RecentHosts), 
+            collect(ComputerName) as RecentHostList) by UserName
+    | RecentHosts > 1 // Multiple hosts in recent timeframe
+}, field=UserName, key=UserName, mode=left, include=[RecentHosts, RecentHostList])
+| eval(BehaviorChangeScore=0)
+| eval(BehaviorChangeScore=if(FileName not in (HistoricalProcessList), BehaviorChangeScore+3, BehaviorChangeScore))
+| eval(BehaviorChangeScore=if(NewExternalConnections > 0, BehaviorChangeScore+2, BehaviorChangeScore))
+| eval(BehaviorChangeScore=if(RecentHosts > 3, BehaviorChangeScore+2, BehaviorChangeScore))
+| eval(BehaviorChangeScore=if(FileName=/.*powershell\.exe|.*cmd\.exe|.*wmic\.exe/i, BehaviorChangeScore+1, BehaviorChangeScore))
+| BehaviorChangeScore >= 5
+| case {
+    (FileName=/.*powershell\.exe/i AND NewExternalConnections > 0) | TakeoverPattern := "PowerShell_External_Access";
+    (RecentHosts > 5 AND FileName not in (HistoricalProcessList)) | TakeoverPattern := "Multi_Host_New_Process";
+    (FileName=/.*net\.exe|.*wmic\.exe/i) | TakeoverPattern := "Administrative_Tool_Usage";
+    * | TakeoverPattern := "General_Behavior_Change";
+}
+| eval(RiskContext=case([
+    (CommandLine=/.*-enc.*-nop|.*downloadstring.*http/i) | "Malicious_Command_Pattern";
+    (Time not between ("08:00", "18:00")) | "After_Hours_Activity";
+    * | "Business_Hours_Activity";
+]))
+| stats(max(BehaviorChangeScore, as=MaxChangeScore), 
+        count(as=NewBehaviorEvents)) by [UserName, TakeoverPattern, RiskContext]
+| sort(MaxChangeScore, order=desc)
+Detecção Exclusiva: Baseline histórico de 30 dias de processos por usuário vs. comportamento atual.
+
+7. Lateral Movement with Legitimate Credentials
+fql
+#event_simpleName=UserLogon
+| LogonType="3" // Network logon
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*psexec|.*wmic.*process.*call.*create|.*powershell.*invoke-command.*computername/i OR
+       FileName=/.*psexec\.exe|.*paexec\.exe/i)
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, start=-60s, end=+300s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [135, 445, 5985, 5986]
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, start=-30s, end=+30s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonType="3"
+    | stats(count(as=RecentNetworkLogons), 
+            dc(ComputerName, as=UniqueTargetHosts)) by UserName
+    | UniqueTargetHosts > 3 // Multiple hosts accessed recently
+}, field=UserName, key=UserName, mode=inner, include=[RecentNetworkLogons, UniqueTargetHosts])
+| eval(LateralMovementScore=0)
+| eval(LateralMovementScore=if(CommandLine=/.*psexec/i, LateralMovementScore+4, LateralMovementScore))
+| eval(LateralMovementScore=if(CommandLine=/.*wmic.*process.*call.*create/i, LateralMovementScore+3, LateralMovementScore))
+| eval(LateralMovementScore=if(UniqueTargetHosts > 5, LateralMovementScore+2, LateralMovementScore))
+| eval(LateralMovementScore=if(RemotePort in [5985, 5986], LateralMovementScore+1, LateralMovementScore)) // WinRM
+| LateralMovementScore >= 5
+| case {
+    (CommandLine=/.*psexec.*-s/i) | MovementTechnique := "PsExec_System_Level";
+    (CommandLine=/.*invoke-command.*-credential/i) | MovementTechnique := "PowerShell_Remoting_Creds";
+    (RemotePort="135" AND CommandLine=/.*wmic/i) | MovementTechnique := "WMI_Lateral_Movement";
+    * | MovementTechnique := "Generic_Network_Execution";
+}
+| eval(MovementContext=case([
+    (Time not between ("08:00", "18:00") AND dayOfWeek() between (1, 5)) | "After_Hours_Movement";
+    (UniqueTargetHosts > 10) | "Widespread_Movement";
+    * | "Limited_Movement";
+]))
+| stats(max(LateralMovementScore, as=MaxMovementScore), 
+        max(UniqueTargetHosts, as=MaxTargetHosts)) by [UserName, MovementTechnique, MovementContext]
+| sort(MaxMovementScore, order=desc)
+Detecção Exclusiva: Correlação de network logons, tools de movimento lateral e múltiplos hosts alvos.
+
+8. Insider Trading - Financial Data Access Pattern
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*excel.*|.*bloomberg.*|.*reuters.*|.*financial.*|.*trading.*/i OR
+   FileName=/.*excel\.exe|.*outlook\.exe|.*bloomberg/i)
+| join(query={
+    #event_simpleName=FileWritten OR #event_simpleName=FileRead
+    | (FilePath=/.*financeiro.*|.*trading.*|.*relatorio.*|.*planilha.*|.*balanc.*|.*resultado.*/i OR
+       FileName=/.*\.xlsx$|.*\.csv$|.*financ.*\.pdf$/i)
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, start=-30s, end=+300s, include=[FilePath, FileName])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ OR
+       RemotePort in [25, 587, 993, 995]) // Email ports
+}, field=[aid, UserName], key=[aid, UserName], mode=left, start=+60s, end=+1800s, include=[RemoteAddressIP4, RemotePort])
+| eval(FinancialDataRisk=0)
+| eval(FinancialDataRisk=if(FilePath=/.*financeiro.*|.*trading.*|.*balanc.*/i, FinancialDataRisk+3, FinancialDataRisk))
+| eval(FinancialDataRisk=if(FileName=/.*\.xlsx$|.*\.csv$/i, FinancialDataRisk+2, FinancialDataRisk))
+| eval(FinancialDataRisk=if(RemotePort in [25, 587], FinancialDataRisk+2, FinancialDataRisk)) // Email transfer
+| eval(FinancialDataRisk=if(CommandLine=/.*bloomberg.*|.*reuters.*/i, FinancialDataRisk+2, FinancialDataRisk))
+| FinancialDataRisk >= 5
+| eval(BrazilianMarketContext=case([
+    (Time between ("09:00", "18:00") AND dayOfWeek() between (1, 5)) | "Market_Hours_Access";
+    (Time between ("18:01", "08:59") OR dayOfWeek() in [6, 7]) | "After_Market_Hours_Access";
+    (Time between ("12:00", "14:00")) | "Lunch_Hour_Access";
+    * | "Unknown_Time_Context";
+}))
+| case {
+    (FilePath=/.*trading.*|.*negociac.*/i AND RemotePort in [25, 587]) | InsiderPattern := "Trading_Data_Email_Transfer";
+    (FileName=/.*balanc.*|.*resultado.*/i) | InsiderPattern := "Balance_Sheet_Access";
+    (CommandLine=/.*bloomberg.*|.*reuters.*/i) | InsiderPattern := "Market_Data_Terminal_Access";
+    * | InsiderPattern := "General_Financial_Data_Access";
+}
+| stats(max(FinancialDataRisk, as=MaxRisk), count(as=FinancialEvents)) by [UserName, InsiderPattern, BrazilianMarketContext]
+| sort(MaxRisk, order=desc)
+Detecção Exclusiva: Detecção de insider trading com contexto do mercado financeiro brasileiro.
+
+9. Privileged Account Abuse - Service Account Misuse
+fql
+#event_simpleName=UserLogon
+| UserName=/.*service.*|.*svc.*|.*app.*|.*system.*|.*sql.*|.*web.*/i // Service accounts
+| LogonType="2" // Interactive logon (unusual for service accounts)
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*net.*user|.*net.*group|.*dsquery|.*csvde|.*ldifde/i OR
+       FileName=/.*mmc\.exe|.*dsa\.msc|.*gpmc\.msc/i) // Administrative tools
+}, field=[aid, UserName], key=[aid, UserName], mode=inner, start=+1m, end=+60m, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonType="2"
+    | stats(count(as=HistoricalInteractiveLogons)) by UserName
+    | HistoricalInteractiveLogons < 5 // Service account rarely logs on interactively
+}, field=UserName, key=UserName, mode=inner, include=[HistoricalInteractiveLogons])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*powershell.*invoke-command|.*psexec.*\\\\|.*wmic.*\/node/i // Remote execution
+}, field=[aid, UserName], key=[aid, UserName], mode=left, start=+30s, end=+300s, include=[CommandLine], suffix="_remote")
+| eval(ServiceAccountAbuseScore=0)
+| eval(ServiceAccountAbuseScore=if(LogonType="2", ServiceAccountAbuseScore+4, ServiceAccountAbuseScore)) // Interactive logon
+| eval(ServiceAccountAbuseScore=if(HistoricalInteractiveLogons < 2, ServiceAccountAbuseScore+3, ServiceAccountAbuseScore)) // Rare interactive
+| eval(ServiceAccountAbuseScore=if(CommandLine=/.*net.*user.*\/add|.*net.*group.*admin.*\/add/i, ServiceAccountAbuseScore+4, ServiceAccountAbuseScore)) // Admin actions
+| eval(ServiceAccountAbuseScore=if(CommandLine_remote!="", ServiceAccountAbuseScore+2, ServiceAccountAbuseScore)) // Remote execution
+| ServiceAccountAbuseScore >= 7
+| case {
+    (CommandLine=/.*net.*user.*\/add/i) | AbusePattern := "Service_Account_User_Creation";
+    (CommandLine=/.*net.*group.*admin.*\/add/i) | AbusePattern := "Service_Account_Admin_Addition";
+    (FileName=/.*dsa\.msc|.*gpmc\.msc/i) | AbusePattern := "Service_Account_AD_Management";
+    (CommandLine_remote!="") | AbusePattern := "Service_Account_Remote_Execution";
+    * | AbusePattern := "General_Service_Account_Abuse";
+}
+| eval(AbuseTiming=case([
+    (Time between ("02:00", "05:00")) | "Deep_Night_Abuse";
+    (Time not between ("08:00", "18:00")) | "After_Hours_Abuse";
+    (dayOfWeek() in [6, 7]) | "Weekend_Abuse";
+    * | "Business_Hours_Abuse";
+]))
+| stats(max(ServiceAccountAbuseScore, as=MaxAbuseScore), 
+        count(as=AbuseEvents)) by [UserName, AbusePattern, AbuseTiming]
+| sort(MaxAbuseScore, order=desc)
+Detecção Exclusiva: Análise de contas de serviço com logons interativos anômalos e ações administrativas.
+
+10. Advanced Persistent Insider - Long-term Reconnaissance
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*net.*view|.*net.*group.*domain|.*dsquery.*user|.*adfind|.*ldapsearch/i OR
+   FileName=/.*bloodhound.*|.*sharphound.*|.*powerview.*/i)
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*net.*view|.*net.*group.*domain|.*dsquery.*user|.*adfind|.*ldapsearch/i
+    | timechart(span=24h, function=count(as=DailyReconCount)) by UserName
+    | DailyReconCount > 0 // User does recon activities daily
+    | stats(count(as=ReconDays), sum(DailyReconCount, as=TotalReconActivities)) by UserName
+    | ReconDays >= 7 AND TotalReconActivities > 20 // Sustained reconnaissance
+}, field=UserName, key=UserName, mode=inner, include=[ReconDays, TotalReconActivities])
+| join(query={
+    #event_simpleName=FileWritten
+    | (FileName=/.*users.*\.txt|.*computers.*\.txt|.*groups.*\.txt|.*bloodhound.*\.zip/i OR
+       FilePath=/.*temp.*|.*downloads.*|.*documents.*/i)
+}, field=[aid, UserName], key=[aid, UserName], mode=left, start=-300s, end=+300s, include=[FileName, FilePath])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [80, 443, 21, 22]
+}, field=[aid, UserName], key=[aid, UserName], mode=left, start=+300s, end=+3600s, include=[RemoteAddressIP4, RemotePort])
+| eval(PersistentInsiderScore=0)
+| eval(PersistentInsiderScore=if(ReconDays >= 14, PersistentInsiderScore+5, PersistentInsiderScore)) // 2+ weeks
+| eval(PersistentInsiderScore=if(TotalReconActivities > 50, PersistentInsiderScore+3, PersistentInsiderScore)) // High volume
+| eval(PersistentInsiderScore=if(FileName=/.*bloodhound.*|.*users.*\.txt/i, PersistentInsiderScore+3, PersistentInsiderScore)) // Data export
+| eval(PersistentInsiderScore=if(RemoteAddressIP4!="", PersistentInsiderScore+2, PersistentInsiderScore)) // External transfer
+| PersistentInsiderScore >= 8
+| case {
+    (FileName=/.*bloodhound.*\.zip/i AND RemoteAddressIP4!="") | InsiderType := "AD_Data_Exfiltration";
+    (ReconDays >= 30 AND TotalReconActivities > 100) | InsiderType := "Long_Term_Surveillance";
+    (CommandLine=/.*dsquery.*user.*admin/i) | InsiderType := "Admin_Account_Reconnaissance";
+    * | InsiderType := "Persistent_Domain_Reconnaissance";
+}
+| eval(ReconPattern=case([
+    (TotalReconActivities / ReconDays > 10) | "High_Intensity_Daily_Recon";
+    (ReconDays >= 21) | "Extended_Duration_Recon";
+    * | "Moderate_Persistent_Recon";
+]))
+| stats(max(PersistentInsiderScore, as=InsiderThreatLevel), 
+        max(ReconDays, as=MaxReconDuration),
+        max(TotalReconActivities, as=MaxReconActivities)) by [UserName, InsiderType, ReconPattern]
+| sort(InsiderThreatLevel, order=desc)
+Detecção Exclusiva: Análise de reconhecimento sustentado ao longo de semanas com correlação temporal única.
