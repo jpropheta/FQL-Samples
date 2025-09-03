@@ -1,0 +1,344 @@
+1. Process Doppelgänging via Transacted NTFS Detection
+fql
+#event_simpleName=SyntheticProcessRollup2
+| ProcessStartFlags=/.*CREATE_SUSPENDED.*EXTENDED_STARTUPINFO/i
+| join(query={
+    #event_simpleName=FileWritten
+    | FilePath=/.*\.exe$/i
+    | Size > 0
+    | WriteFlags=/.*TRANSACTION/i // Transacted file operation
+}, field=aid, key=aid, mode=inner, start=-10s, end=+2s, include=[FilePath, Size, WriteFlags])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | ParentImageFileName=/.*explorer\.exe|.*cmd\.exe|.*powershell\.exe/i
+}, field=[aid, ParentProcessId], key=[aid, RawProcessId], mode=inner, include=[ParentImageFileName])
+| join(query={
+    #event_simpleName=ImageHash
+    | MD5HashData=""  // No hash due to transacted file
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[MD5HashData])
+| join(query={
+    #event_simpleName=ProcessMemoryAccess
+    | AccessType="PROCESS_VM_WRITE"
+    | MemoryRegion="IMAGE_SECTION"
+}, field=[aid, TargetProcessId], key=[aid, TargetProcessId], mode=inner, start=+1s, end=+30s, include=[AccessType, MemoryRegion])
+| eval(DoppelgangingScore=0)
+| eval(DoppelgangingScore=if(WriteFlags=/.*TRANSACTION/i, DoppelgangingScore+4, DoppelgangingScore))
+| eval(DoppelgangingScore=if(ProcessStartFlags=/.*CREATE_SUSPENDED/i, DoppelgangingScore+3, DoppelgangingScore))
+| eval(DoppelgangingScore=if(MD5HashData="", DoppelgangingScore+2, DoppelgangingScore))
+| eval(DoppelgangingScore=if(AccessType="PROCESS_VM_WRITE", DoppelgangingScore+2, DoppelgangingScore))
+| DoppelgangingScore >= 7
+| case {
+    (Size > 1048576 AND ParentImageFileName=/.*powershell\.exe/i) | DoppelgangingType := "PowerShell_Doppelganging";
+    (Size < 102400 AND AccessType="PROCESS_VM_WRITE") | DoppelgangingType := "Shellcode_Doppelganging";
+    * | DoppelgangingType := "Binary_Doppelganging";
+}
+| stats(max(DoppelgangingScore, as=ThreatLevel), count(as=DoppelgangingEvents)) by [aid, DoppelgangingType, ParentImageFileName]
+| sort(ThreatLevel, order=desc)
+Técnica Exclusiva: Detecção de Process Doppelgänging via transacted NTFS - invisível para outros EDRs.
+
+2. Atom Bombing via Global Atom Table Manipulation
+fql
+#event_simpleName=ProcessRollup2
+| CommandLine=/.*globaladdatom|.*globalfindatom|.*globalgetatomname/i
+| join(query={
+    #event_simpleName=SystemCallActivity
+    | SystemCall="NtQueueApcThread"
+    | APCRoutine!=""
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, start=-5s, end=+30s, include=[SystemCall, APCRoutine, TargetThreadId])
+| join(query={
+    #event_simpleName=ProcessMemoryAccess
+    | AccessType="PROCESS_VM_WRITE"
+    | MemoryAddress!=""
+}, field=[aid, TargetProcessId], key=[aid, SourceProcessId], mode=inner, start=+1s, end=+60s, include=[MemoryAddress, AccessType])
+| join(query={
+    #event_simpleName=RemoteThreadCreate
+    | SourceProcessId!=TargetProcessId
+}, field=[aid, TargetProcessId], key=[aid, TargetProcessId], mode=inner, include=[SourceProcessId, TargetThreadId])
+| eval(AtomBombingIndicators=0)
+| eval(AtomBombingIndicators=if(CommandLine=/.*globaladdatom/i, AtomBombingIndicators+3, AtomBombingIndicators))
+| eval(AtomBombingIndicators=if(SystemCall="NtQueueApcThread", AtomBombingIndicators+4, AtomBombingIndicators))
+| eval(AtomBombingIndicators=if(AccessType="PROCESS_VM_WRITE", AtomBombingIndicators+2, AtomBombingIndicators))
+| eval(AtomBombingIndicators=if(SourceProcessId!=TargetProcessId, AtomBombingIndicators+2, AtomBombingIndicators))
+| AtomBombingIndicators >= 6
+| case {
+    (APCRoutine=/.*ntdll.*|.*kernel32.*/i) | InjectionVector := "System_DLL_APC";
+    (MemoryAddress=/^0x[7-F]/i) | InjectionVector := "High_Memory_Injection"; // User space high addresses
+    * | InjectionVector := "Generic_Atom_Bombing";
+}
+| stats(max(AtomBombingIndicators, as=ThreatScore), count(as=InjectionAttempts)) by [aid, InjectionVector, SystemCall]
+| sort(ThreatScore, order=desc)
+Técnica Exclusiva: Correlação de system calls, APC queuing e atom table manipulation.
+
+3. LSASS Process Tree Manipulation & Credential Access
+fql
+#event_simpleName=ProcessRollup2
+| ImageFileName=/.*lsass\.exe$/i
+| join(query={
+    #event_simpleName=ProcessMemoryAccess
+    | SourceProcessId!=TargetProcessId
+    | AccessType in ["PROCESS_VM_READ", "PROCESS_QUERY_INFORMATION", "PROCESS_DUP_HANDLE"]
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[SourceProcessId, AccessType, MemoryRegion])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | FileName!=/.*system|.*csrss\.exe|.*winlogon\.exe|.*services\.exe/i // Not system processes
+}, field=[aid, SourceProcessId], key=[aid, RawProcessId], mode=inner, include=[FileName, CommandLine, UserName])
+| join(query={
+    #event_simpleName=KernelProcessEvents
+    | EventType="ProcessHandleOpen"
+    | HandleAccess=/.*PROCESS_ALL_ACCESS|.*PROCESS_VM_READ/i
+}, field=[aid, TargetProcessId], key=[aid, ProcessId], mode=inner, include=[HandleAccess, EventType])
+| join(query={
+    #event_simpleName=SyntheticProcessRollup2
+    | IntegrityLevel in ["High", "System"]
+}, field=[aid, SourceProcessId], key=[aid, RawProcessId], mode=left, include=[IntegrityLevel])
+| eval(LSASSAccessRisk=0)
+| eval(LSASSAccessRisk=if(AccessType="PROCESS_VM_READ", LSASSAccessRisk+4, LSASSAccessRisk))
+| eval(LSASSAccessRisk=if(HandleAccess=/.*PROCESS_ALL_ACCESS/i, LSASSAccessRisk+3, LSASSAccessRisk))
+| eval(LSASSAccessRisk=if(FileName=/.*powershell\.exe|.*cmd\.exe/i, LSASSAccessRisk+2, LSASSAccessRisk))
+| eval(LSASSAccessRisk=if(IntegrityLevel!="System", LSASSAccessRisk+2, LSASSAccessRisk)) // Non-system accessing LSASS
+| LSASSAccessRisk >= 6
+| case {
+    (CommandLine=/.*mimikatz|.*procdump|.*comsvcs/i) | CredentialThreat := "Known_Credential_Tool";
+    (FileName=/.*taskmgr\.exe|.*procexp\.exe/i AND AccessType="PROCESS_VM_READ") | CredentialThreat := "Process_Manager_Dump";
+    (HandleAccess=/.*PROCESS_ALL_ACCESS/i AND IntegrityLevel!="System") | CredentialThreat := "Suspicious_Full_Access";
+    * | CredentialThreat := "Generic_LSASS_Access";
+}
+| stats(max(LSASSAccessRisk, as=RiskLevel), count(as=AccessAttempts), 
+        dc(SourceProcessId, as=UniqueAccessors)) by [aid, UserName, CredentialThreat]
+| sort(RiskLevel, order=desc)
+Técnica Exclusiva: Visibilidade completa de handle access, memory regions e kernel events para LSASS.
+
+4. ETW (Event Tracing for Windows) Provider Tampering
+fql
+#event_simpleName=KernelProcessEvents
+| EventType="ETWProviderModification"
+| (ProviderGUID="{15CA44FF-4D7A-4BAA-BBA5-0998955E531E}" OR  // Microsoft-Windows-Kernel-Registry
+   ProviderGUID="{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}" OR  // Microsoft-Windows-Kernel-Process
+   ProviderGUID="{9E814AAD-3204-11D2-9A82-006008A86939}")     // Microsoft-Windows-Kernel-EventTracing
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*logman.*stop|.*wevtutil.*sl.*\/e:false|.*powershell.*set-etwtraceprovider/i
+}, field=[aid, ContextProcessId], key=[aid, RawProcessId], mode=inner, start=-30s, end=+30s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=SystemCallActivity
+    | SystemCall in ["NtTraceControl", "NtSetInformationProcess"]
+}, field=[aid, ContextProcessId], key=[aid, RawProcessId], mode=left, start=-10s, end=+10s, include=[SystemCall])
+| eval(ETWTamperingScore=0)
+| eval(ETWTamperingScore=if(EventType="ETWProviderModification", ETWTamperingScore+4, ETWTamperingScore))
+| eval(ETWTamperingScore=if(CommandLine=/.*logman.*stop/i, ETWTamperingScore+3, ETWTamperingScore))
+| eval(ETWTamperingScore=if(SystemCall="NtTraceControl", ETWTamperingScore+2, ETWTamperingScore))
+| eval(ETWTamperingScore=if(ProviderGUID="{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}", ETWTamperingScore+2, ETWTamperingScore)) // Process provider
+| ETWTamperingScore >= 5
+| case {
+    (ProviderGUID="{15CA44FF-4D7A-4BAA-BBA5-0998955E531E}" AND CommandLine=/.*stop/i) | EvasionTechnique := "Registry_ETW_Evasion";
+    (ProviderGUID="{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}") | EvasionTechnique := "Process_ETW_Evasion";
+    (SystemCall="NtTraceControl") | EvasionTechnique := "System_Call_ETW_Bypass";
+    * | EvasionTechnique := "Generic_ETW_Tampering";
+}
+| stats(max(ETWTamperingScore, as=TamperingLevel), count(as=TamperingEvents)) by [aid, EvasionTechnique, ProviderGUID]
+| sort(TamperingLevel, order=desc)
+Técnica Exclusiva: Detecção de tampering com ETW providers via kernel events e system calls.
+
+5. PEB (Process Environment Block) Manipulation Detection
+fql
+#event_simpleName=ProcessEnvironmentChange
+| (EnvironmentVariable="Path" OR EnvironmentVariable="SystemRoot" OR EnvironmentVariable="windir")
+| join(query={
+    #event_simpleName=ProcessMemoryAccess
+    | MemoryRegion="PEB_REGION"
+    | AccessType="PROCESS_VM_WRITE"
+}, field=[aid, TargetProcessId], key=[aid, TargetProcessId], mode=inner, include=[MemoryAddress, AccessType])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*ntdll.*peb|.*teb.*manipulation|.*process.*environment/i
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=left, start=-60s, end=+60s, include=[CommandLine])
+| join(query={
+    #event_simpleName=SyntheticProcessRollup2
+    | ProcessFlags=/.*DEBUG_PROCESS|.*DEBUG_ONLY_THIS_PROCESS/i
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=left, include=[ProcessFlags])
+| eval(PEBTamperingRisk=0)
+| eval(PEBTamperingRisk=if(MemoryRegion="PEB_REGION", PEBTamperingRisk+4, PEBTamperingRisk))
+| eval(PEBTamperingRisk=if(EnvironmentVariable in ["SystemRoot", "windir"], PEBTamperingRisk+3, PEBTamperingRisk))
+| eval(PEBTamperingRisk=if(ProcessFlags=/.*DEBUG_PROCESS/i, PEBTamperingRisk+2, PEBTamperingRisk))
+| eval(PEBTamperingRisk=if(CommandLine=/.*peb.*manipulation/i, PEBTamperingRisk+2, PEBTamperingRisk))
+| PEBTamperingRisk >= 5
+| case {
+    (EnvironmentVariable="Path" AND AccessType="PROCESS_VM_WRITE") | ManipulationType := "Path_Environment_Hijack";
+    (EnvironmentVariable="SystemRoot" AND MemoryRegion="PEB_REGION") | ManipulationType := "System_Directory_Spoofing";
+    (ProcessFlags=/.*DEBUG_PROCESS/i) | ManipulationType := "Debug_PEB_Manipulation";
+    * | ManipulationType := "Generic_PEB_Tampering";
+}
+| stats(max(PEBTamperingRisk, as=RiskLevel), count(as=TamperingEvents)) by [aid, ManipulationType, EnvironmentVariable]
+| sort(RiskLevel, order=desc)
+Técnica Exclusiva: Visibilidade única de PEB manipulation via environment changes e memory access.
+
+6. AMSI (Antimalware Scan Interface) Bypass Correlation
+fql
+#event_simpleName=SystemCallActivity
+| SystemCall in ["NtWriteVirtualMemory", "NtProtectVirtualMemory"]
+| TargetAddress=/.*amsi\.dll.*|.*0x[0-9A-F]{8,16}.*/i
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*amsi.*bypass|.*amsi.*patch|.*\[Ref\].*Assembly.*amsi/i
+}, field=[aid, SourceProcessId], key=[aid, RawProcessId], mode=inner, start=-30s, end=+30s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=MemoryProtectionChange
+    | NewProtection="PAGE_EXECUTE_READWRITE"
+    | MemoryRegion=/.*amsi\.dll.*/i
+}, field=[aid, SourceProcessId], key=[aid, ProcessId], mode=inner, include=[NewProtection, OldProtection])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | ImageFileName=/.*powershell\.exe|.*powershell_ise\.exe/i
+}, field=[aid, SourceProcessId], key=[aid, RawProcessId], mode=left, include=[ImageFileName])
+| eval(AMSIBypassScore=0)
+| eval(AMSIBypassScore=if(SystemCall="NtWriteVirtualMemory", AMSIBypassScore+3, AMSIBypassScore))
+| eval(AMSIBypassScore=if(NewProtection="PAGE_EXECUTE_READWRITE", AMSIBypassScore+4, AMSIBypassScore))
+| eval(AMSIBypassScore=if(CommandLine=/.*amsi.*bypass/i, AMSIBypassScore+3, AMSIBypassScore))
+| eval(AMSIBypassScore=if(ImageFileName=/.*powershell\.exe/i, AMSIBypassScore+1, AMSIBypassScore))
+| AMSIBypassScore >= 6
+| case {
+    (CommandLine=/.*\[Ref\].*Assembly/i AND NewProtection="PAGE_EXECUTE_READWRITE") | BypassMethod := "Reflection_Memory_Patch";
+    (SystemCall="NtWriteVirtualMemory" AND TargetAddress=/.*amsi\.dll/i) | BypassMethod := "Direct_DLL_Patching";
+    (CommandLine=/.*amsi.*patch/i) | BypassMethod := "PowerShell_AMSI_Patch";
+    * | BypassMethod := "Generic_AMSI_Bypass";
+}
+| stats(max(AMSIBypassScore, as=BypassLevel), count(as=BypassAttempts)) by [aid, BypassMethod, ImageFileName]
+| sort(BypassLevel, order=desc)
+Técnica Exclusiva: Correlação de system calls, memory protection e AMSI DLL tampering.
+
+7. Kernel APC (Asynchronous Procedure Call) Injection
+fql
+#event_simpleName=SystemCallActivity
+| SystemCall in ["NtQueueApcThread", "NtOpenThread", "NtAllocateVirtualMemory"]
+| join(query={
+    #event_simpleName=KernelProcessEvents
+    | EventType="ThreadAPCQueued"
+    | APCType="UserAPC"
+}, field=[aid, TargetThreadId], key=[aid, ThreadId], mode=inner, include=[APCType, APCRoutine, EventType])
+| join(query={
+    #event_simpleName=ProcessMemoryAccess
+    | AccessType="PROCESS_VM_OPERATION"
+    | MemoryRegion="ALLOCATED_MEMORY"
+}, field=[aid, SourceProcessId], key=[aid, SourceProcessId], mode=inner, start=-10s, end=+10s, include=[MemoryAddress, AccessType])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | TokenType="TokenElevationTypeFull"
+}, field=[aid, SourceProcessId], key=[aid, RawProcessId], mode=left, include=[TokenType, UserName])
+| eval(KernelAPCRisk=0)
+| eval(KernelAPCRisk=if(SystemCall="NtQueueApcThread", KernelAPCRisk+4, KernelAPCRisk))
+| eval(KernelAPCRisk=if(APCType="UserAPC", KernelAPCRisk+3, KernelAPCRisk))
+| eval(KernelAPCRisk=if(AccessType="PROCESS_VM_OPERATION", KernelAPCRisk+2, KernelAPCRisk))
+| eval(KernelAPCRisk=if(TokenType="TokenElevationTypeFull", KernelAPCRisk+1, KernelAPCRisk))
+| KernelAPCRisk >= 6
+| case {
+    (APCRoutine=/.*ntdll.*LdrLoadDll/i) | InjectionType := "DLL_Load_APC_Injection";
+    (APCRoutine=/.*kernel32.*CreateThread/i) | InjectionType := "Thread_Creation_APC";
+    (MemoryRegion="ALLOCATED_MEMORY" AND SystemCall="NtAllocateVirtualMemory") | InjectionType := "Shellcode_APC_Injection";
+    * | InjectionType := "Generic_Kernel_APC_Injection";
+}
+| stats(max(KernelAPCRisk, as=RiskLevel), count(as=InjectionEvents)) by [aid, UserName, InjectionType, APCRoutine]
+| sort(RiskLevel, order=desc)
+Técnica Exclusiva: Correlação de kernel APC queuing com memory allocation e thread context.
+
+8. Hardware Breakpoint Evasion Detection
+fql
+#event_simpleName=SystemCallActivity
+| SystemCall in ["NtSetContextThread", "NtGetContextThread", "NtContinue"]
+| join(query={
+    #event_simpleName=KernelProcessEvents
+    | EventType="DebugRegisterModification"
+    | (DR0!="" OR DR1!="" OR DR2!="" OR DR3!="" OR DR7!="")
+}, field=[aid, TargetThreadId], key=[aid, ThreadId], mode=inner, include=[DR0, DR1, DR2, DR3, DR7, EventType])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*ntsetcontextthread|.*hardware.*breakpoint|.*debug.*register/i
+}, field=[aid, SourceProcessId], key=[aid, RawProcessId], mode=left, start=-60s, end=+60s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=SyntheticProcessRollup2
+    | ProcessFlags!=/.*DEBUG_PROCESS/i // Not a legitimate debugger
+}, field=[aid, SourceProcessId], key=[aid, RawProcessId], mode=inner, include=[ProcessFlags])
+| eval(HardwareBreakpointRisk=0)
+| eval(HardwareBreakpointRisk=if(SystemCall="NtSetContextThread", HardwareBreakpointRisk+3, HardwareBreakpointRisk))
+| eval(HardwareBreakpointRisk=if(DR7!="", HardwareBreakpointRisk+4, HardwareBreakpointRisk)) // DR7 controls other DRx
+| eval(HardwareBreakpointRisk=if(CommandLine=/.*hardware.*breakpoint/i, HardwareBreakpointRisk+2, HardwareBreakpointRisk))
+| eval(HardwareBreakpointRisk=if(ProcessFlags!=/.*DEBUG_PROCESS/i, HardwareBreakpointRisk+2, HardwareBreakpointRisk))
+| HardwareBreakpointRisk >= 6
+| case {
+    (DR7!="" AND SystemCall="NtSetContextThread") | EvasionTechnique := "Hardware_Breakpoint_Manipulation";
+    (DR0!="" OR DR1!="" OR DR2!="" OR DR3!="") | EvasionTechnique := "Debug_Register_Evasion";
+    (CommandLine=/.*ntsetcontextthread/i) | EvasionTechnique := "Context_Thread_Evasion";
+    * | EvasionTechnique := "Generic_Hardware_Evasion";
+}
+| stats(max(HardwareBreakpointRisk, as=RiskLevel), count(as=EvasionEvents)) by [aid, EvasionTechnique, FileName]
+| sort(RiskLevel, order=desc)
+Técnica Exclusiva: Visibilidade única de debug registers e hardware breakpoint manipulation.
+
+9. Advanced Rootkit Behavior via System Call Hooking
+fql
+#event_simpleName=KernelProcessEvents
+| EventType="SystemCallTableModification"
+| (OriginalHandler!="" AND NewHandler!="")
+| join(query={
+    #event_simpleName=DriverLoad
+    | ImageFileName=/.*\.sys$/i
+    | SubjectCN!="Microsoft Corporation"
+}, field=aid, key=aid, mode=inner, start=-300s, end=+60s, include=[ImageFileName, SubjectCN])
+| join(query={
+    #event_simpleName=SystemCallActivity
+    | SystemCall in ["NtReadVirtualMemory", "NtWriteVirtualMemory", "NtProtectVirtualMemory"]
+    | TargetAddress=/.*ntoskrnl.*|.*hal\.dll.*/i
+}, field=aid, key=aid, mode=inner, start=-60s, end=+300s, include=[SystemCall, TargetAddress])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | IntegrityLevel="System"
+    | TokenType="TokenElevationTypeFull"
+}, field=[aid, ContextProcessId], key=[aid, RawProcessId], mode=inner, include=[IntegrityLevel, UserName])
+| eval(RootkitScore=0)
+| eval(RootkitScore=if(EventType="SystemCallTableModification", RootkitScore+5, RootkitScore))
+| eval(RootkitScore=if(SubjectCN!="Microsoft Corporation", RootkitScore+3, RootkitScore))
+| eval(RootkitScore=if(TargetAddress=/.*ntoskrnl/i, RootkitScore+2, RootkitScore))
+| eval(RootkitScore=if(SystemCall="NtWriteVirtualMemory", RootkitScore+2, RootkitScore))
+| RootkitScore >= 8
+| case {
+    (NewHandler!="" AND TargetAddress=/.*ntoskrnl/i) | RootkitType := "Kernel_SSDT_Hook";
+    (SystemCall="NtWriteVirtualMemory" AND IntegrityLevel="System") | RootkitType := "Direct_Kernel_Patch";
+    (SubjectCN="" AND ImageFileName=/.*\.sys/i) | RootkitType := "Unsigned_Kernel_Rootkit";
+    * | RootkitType := "Generic_System_Hook";
+}
+| stats(max(RootkitScore, as=ThreatLevel), count(as=RootkitActivity)) by [aid, UserName, RootkitType, ImageFileName]
+| sort(ThreatLevel, order=desc)
+Técnica Exclusiva: Detecção de rootkit via system call table modification e kernel patching.
+
+10. Advanced Persistence via WMI Event Subscription Chain
+fql
+#event_simpleName=WmiEventSubscription
+| (EventType="EventConsumer" OR EventType="EventFilter" OR EventType="FilterToConsumerBinding")
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*wmic.*event.*create|.*powershell.*register-wmievent|.*new-object.*management\.managementobject/i
+}, field=[aid, ContextProcessId], key=[aid, RawProcessId], mode=inner, start=-60s, end=+60s, include=[CommandLine, UserName])
+| join(query={
+    #event_simpleName=WmiEventSubscription
+    | EventType="EventConsumer"
+    | ConsumerName!=""
+}, field=[aid, SubscriptionId], key=[aid, SubscriptionId], mode=inner, include=[ConsumerName, ConsumerType, CommandLineTemplate])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | ParentImageFileName=/.*wmiprvse\.exe/i // WMI Provider Service
+}, field=aid, key=aid, mode=inner, start=+60s, end=+3600s, include=[ParentImageFileName, ImageFileName])
+| eval(WMIPersistenceRisk=0)
+| eval(WMIPersistenceRisk=if(EventType="FilterToConsumerBinding", WMIPersistenceRisk+4, WMIPersistenceRisk))
+| eval(WMIPersistenceRisk=if(CommandLineTemplate=/.*powershell.*-enc|.*cmd.*\/c.*echo/i, WMIPersistenceRisk+3, WMIPersistenceRisk))
+| eval(WMIPersistenceRisk=if(ConsumerType="CommandLineEventConsumer", WMIPersistenceRisk+2, WMIPersistenceRisk))
+| eval(WMIPersistenceRisk=if(ParentImageFileName=/.*wmiprvse\.exe/i, WMIPersistenceRisk+1, WMIPersistenceRisk))
+| WMIPersistenceRisk >= 6
+| case {
+    (CommandLineTemplate=/.*powershell.*-enc.*-nop/i) | PersistenceVector := "Encoded_PowerShell_WMI";
+    (ConsumerType="CommandLineEventConsumer" AND CommandLineTemplate=/.*http/i) | PersistenceVector := "Network_Download_WMI";
+    (EventType="FilterToConsumerBinding" AND ParentImageFileName=/.*wmiprvse\.exe/i) | PersistenceVector := "Complete_WMI_Chain";
+    * | PersistenceVector := "Generic_WMI_Persistence";
+}
+| stats(max(WMIPersistenceRisk, as=RiskLevel), count(as=PersistenceEvents), 
+        collect([ConsumerName, CommandLineTemplate], limit=3) as WMIDetails) by [aid, UserName, PersistenceVector]
+| sort(RiskLevel, order=desc)
+Técnica Exclusiva: Correlação completa de WMI event subscription chain com process ancestry.
