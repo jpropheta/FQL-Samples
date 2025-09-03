@@ -1,0 +1,169 @@
+1. Detecção de Lateral Movement Avançado
+fql
+#event_simpleName=ProcessRollup2
+| case {
+    CommandLine=/.*psexec|.*wmic|.*powershell.*invoke-command/i | LateralMovementTool := "PsExec/WMI/PSRemoting";
+    CommandLine=/.*net use|.*net view|.*nltest/i | LateralMovementTool := "NetCommands";
+    * | LateralMovementTool := "Other";
+}
+| groupBy([aid, UserName], function=([count(as=EventCount), collect([TargetFileName, CommandLine])])) 
+| EventCount > 5
+| sort(EventCount, order=desc)
+Propósito: Identifica padrões de movimento lateral que frequentemente passam despercebidos em SIEMs tradicionais.
+
+2. Análise Comportamental de Usuários Privilegiados
+fql
+#event_simpleName=UserLogon
+| UserName=/.*admin.*|.*adm.*|.*root|.*sa$/i
+| case {
+    LogonType="2" | AccessType := "Interactive";
+    LogonType="3" | AccessType := "Network";
+    LogonType="10" | AccessType := "RemoteDesktop";
+    * | AccessType := "Other";
+}
+| timechart(span=1h, function=[count(as=LogonCount), dc(ComputerName, as=UniqueHosts)], series=UserName)
+| LogonCount > 10 OR UniqueHosts > 5
+Propósito: Monitora comportamentos anômalos de contas privilegiadas baseado em padrões de acesso.
+
+3. Correlação Multi-Staged Attack
+fql
+(#event_simpleName=ProcessRollup2 CommandLine=/.*powershell.*downloadstring|.*iex.*invoke-expression/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4 
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=aid, key=aid, include=[RemoteAddressIP4, RemotePort], mode=left)
+| join(query={
+    #event_simpleName=DNSRequest
+    | DomainName=/.*\.tk$|.*\.ml$|.*\.ga$/
+}, field=aid, key=aid, include=[DomainName], mode=left)
+| groupBy([aid, UserName], function=count())
+Propósito: Correlaciona múltiplas fases de ataque (download > conexão > DNS suspeito) em uma única query.
+
+4. Detecção de Credential Dumping Avançado
+fql
+#event_simpleName=ProcessRollup2
+| case {
+    (FileName=/.*mimikatz|.*procdump|.*pwdump/i OR CommandLine=/.*sekurlsa|.*logonpasswords|.*sam/i) | ThreatType := "CredentialDump_Direct";
+    (CommandLine=/.*lsass|.*sam|.*ntds\.dit/i AND CommandLine=/.*copy|.*xcopy|.*robocopy/i) | ThreatType := "CredentialDump_FileAccess";
+    (ImageFileName=/.*ntdsutil\.exe/i AND CommandLine=/.*create.*full/i) | ThreatType := "CredentialDump_NTDSUtil";
+    * | ThreatType := null;
+}
+| ThreatType!=null
+| stats(dc(aid, as=AffectedHosts), dc(UserName, as=UniqueUsers)) by ThreatType
+| sort(AffectedHosts, order=desc)
+Propósito: Detecta diferentes técnicas de extração de credenciais com categorização automática.
+
+5. Hunting de Living-off-the-Land Binaries (LOLBins)
+fql
+#event_simpleName=ProcessRollup2
+| FileName=/.*certutil\.exe|.*bitsadmin\.exe|.*regsvr32\.exe|.*rundll32\.exe|.*mshta\.exe|.*cscript\.exe|.*wscript\.exe/i
+| case {
+    (FileName=/.*certutil\.exe/i AND CommandLine=/.*-urlcache|.*-decode|.*-encode/i) | Technique := "Certutil_Download_Decode";
+    (FileName=/.*bitsadmin\.exe/i AND CommandLine=/.*transfer|.*download/i) | Technique := "BITS_Download";
+    (FileName=/.*regsvr32\.exe/i AND CommandLine=/.*scrobj\.dll|.*http/i) | Technique := "Regsvr32_Bypass";
+    (FileName=/.*rundll32\.exe/i AND CommandLine=/.*javascript|.*vbscript/i) | Technique := "Rundll32_Script";
+    * | Technique := "Other_LOLBin";
+}
+| stats(count(as=Usage), dc(aid, as=Hosts)) by [Technique, UserName]
+| sort(Usage, order=desc)
+Propósito: Identifica uso malicioso de binários legítimos do Windows.
+
+6. Detecção de Insider Threat - Exfiltração de Dados
+fql
+#event_simpleName=ProcessRollup2 CommandLine=/.*rar\.exe|.*7z\.exe|.*winzip|.*compress/i
+| join(query={
+    #event_simpleName=NetworkConnectIP4 
+    | RemotePort in [21, 22, 443, 80, 25]
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner)
+| join(query={
+    #event_simpleName=NewExecutableWritten
+    | FileName=/.*\.zip$|.*\.rar$|.*\.7z$/i
+}, field=aid, key=aid, mode=inner, include=[FileName])
+| eval(DataSize=round(Size/1048576, 2))
+| DataSize > 100
+| stats(sum(DataSize, as=TotalMB), count(as=Files)) by [UserName, aid]
+| sort(TotalMB, order=desc)
+Propósito: Detecta potencial exfiltração através de compressão e transferência de grandes volumes.
+
+7. Análise de Cadeia de Infecção (Kill Chain)
+fql
+// Fase 1: Initial Access
+#event_simpleName=ProcessRollup2 ParentImageFileName=/.*outlook\.exe|.*chrome\.exe|.*firefox\.exe/i
+| FileName=/.*\.exe$/i AND FilePath!=/^C:\\Program Files|^C:\\Windows/
+| join(query={
+    // Fase 2: Execution
+    #event_simpleName=ProcessRollup2 
+    | CommandLine=/.*powershell|.*cmd\.exe/i
+}, field=aid, key=aid, mode=inner, start=-5m, end=+30m)
+| join(query={
+    // Fase 3: Persistence
+    #event_simpleName=AsepValueUpdate OR #event_simpleName=ServiceInstalled
+}, field=aid, key=aid, mode=left, start=+1m, end=+60m)
+| join(query={
+    // Fase 4: C2 Communication
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=aid, key=aid, mode=left, start=+1m, end=+120m)
+| stats(count()) by aid
+Propósito: Mapeia toda a cadeia de ataque desde acesso inicial até C2.
+
+8. Monitoramento de Privilege Escalation
+fql
+#event_simpleName=UserLogon
+| LogonType="4"
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*runas|.*psexec.*-s|.*at\.exe|.*schtasks/i OR 
+       TokenType="TokenElevationTypeDefault")
+}, field=aid, key=aid, mode=inner, start=-2m, end=+2m)
+| case {
+    CommandLine=/.*runas/i | EscalationMethod := "RunAs";
+    CommandLine=/.*psexec.*-s/i | EscalationMethod := "PsExec_System";
+    CommandLine=/.*at\.exe|.*schtasks/i | EscalationMethod := "ScheduledTask";
+    TokenType="TokenElevationTypeDefault" | EscalationMethod := "Token_Manipulation";
+    * | EscalationMethod := "Unknown";
+}
+| stats(count(), dc(UserName, as=Users)) by EscalationMethod
+Propósito: Detecta tentativas de escalação de privilégios através de múltiplas técnicas.
+
+9. Detecção de Persistência Avançada
+fql
+(#event_simpleName=AsepValueUpdate OR #event_simpleName=ServiceInstalled OR #event_simpleName=ScheduledTaskRegistered)
+| case {
+    #event_simpleName="AsepValueUpdate" | PersistenceType := "Registry_ASEP";
+    #event_simpleName="ServiceInstalled" | PersistenceType := "Windows_Service";
+    #event_simpleName="ScheduledTaskRegistered" | PersistenceType := "Scheduled_Task";
+}
+| regex("(?i)(?P<SuspiciousPattern>powershell|cmd|certutil|bitsadmin|wmic|mshta)", field=ValueData, strict=false)
+| SuspiciousPattern!=null
+| eval(RiskScore=case([
+    ValueData=/.*-enc.*-nop.*-w.*hidden/i | 5;
+    ValueData=/.*iex.*downloadstring/i | 4;
+    ValueData=/.*invoke-expression/i | 3;
+    * | 1;
+]))
+| stats(sum(RiskScore, as=TotalRisk), count(as=PersistenceAttempts)) by [aid, UserName, PersistenceType]
+| sort(TotalRisk, order=desc)
+Propósito: Avalia e pontua diferentes métodos de persistência com base no risco.
+
+10. Detecção de Advanced Malware Behavior
+fql
+#event_simpleName=ProcessRollup2
+| join(query={
+    #event_simpleName=ImageHash
+    | MD5HashData!=""
+}, field=aid, key=aid, mode=inner, include=[MD5HashData, SHA256HashData])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=left, include=[RemoteAddressIP4, RemotePort])
+| eval(SuspiciousIndicators=0)
+| eval(SuspiciousIndicators=if(CommandLine=/.*-enc|-nop|-w\s+hidden/i, SuspiciousIndicators+1, SuspiciousIndicators))
+| eval(SuspiciousIndicators=if(FilePath!=/^C:\\Program Files|^C:\\Windows/, SuspiciousIndicators+1, SuspiciousIndicators))
+| eval(SuspiciousIndicators=if(RemoteAddressIP4!="", SuspiciousIndicators+1, SuspiciousIndicators))
+| eval(SuspiciousIndicators=if(FileName=/.*\.(tmp|temp|dll)$/i, SuspiciousIndicators+1, SuspiciousIndicators))
+| SuspiciousIndicators >= 2
+| stats(max(SuspiciousIndicators, as=MaxRisk), dc(RemoteAddressIP4, as=UniqueIPs)) by [aid, MD5HashData, FileName]
+| sort(MaxRisk, order=desc)
+Propósito: Correlaciona múltiplos indicadores comportamentais para detectar malware sofisticado.
