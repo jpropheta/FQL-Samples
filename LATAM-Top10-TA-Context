@@ -1,0 +1,413 @@
+1. Banking Trojans Brasileiros (Guildma/Grandoreiro/Javali)
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*banco.*brasil|.*bradesco|.*itau|.*santander|.*caixa|.*nubank/i OR
+   FileName=/.*bank.*|.*security.*|.*update.*\.exe/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4=/^(177\.|179\.|181\.|186\.|189\.|200\.|201\.)/i OR // Brazilian IP ranges
+       RemoteAddressIP4=/.*\.com\.br$|.*\.net\.br$/i)
+    | RemotePort in [80, 443, 8080, 8443]
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*overlay.*|.*keylog.*|.*screenshot.*|.*clipper.*/i
+}, field=aid, key=aid, mode=left, start=-30s, end=+300s, include=[CommandLine])
+| join(query={
+    #event_simpleName=FileWritten
+    | (FileName=/.*\.dll$|.*\.tmp$/i AND 
+       FilePath=/.*temp.*|.*appdata.*roaming.*|.*public.*/i)
+}, field=aid, key=aid, mode=left, start=-60s, end=+120s, include=[FileName, FilePath])
+| eval(BankingTrojanScore=0)
+| eval(BankingTrojanScore=if(CommandLine=/.*banco.*brasil|.*bradesco|.*itau/i, BankingTrojanScore+4, BankingTrojanScore))
+| eval(BankingTrojanScore=if(RemoteAddressIP4=/^(177\.|179\.|181\.)/i, BankingTrojanScore+3, BankingTrojanScore)) // Common C2 ranges
+| eval(BankingTrojanScore=if(CommandLine=/.*overlay.*|.*keylog.*/i, BankingTrojanScore+3, BankingTrojanScore))
+| eval(BankingTrojanScore=if(FilePath=/.*appdata.*roaming.*/i, BankingTrojanScore+2, BankingTrojanScore))
+| BankingTrojanScore >= 6
+| case {
+    (CommandLine=/.*banco.*brasil/i AND RemoteAddressIP4=/^177\./i) | TrojanFamily := "Guildma_Variant";
+    (CommandLine=/.*bradesco|.*itau/i AND CommandLine=/.*overlay/i) | TrojanFamily := "Grandoreiro_Variant";
+    (FileName=/.*security.*\.exe/i AND FilePath=/.*temp/i) | TrojanFamily := "Javali_Variant";
+    * | TrojanFamily := "Generic_Brazilian_Banking_Trojan";
+}
+| eval(BrazilianBankingHours=case([
+    (Time between ("08:00", "16:00") AND dayOfWeek() between (1, 5)) | "Banking_Business_Hours";
+    (Time between ("16:01", "07:59") OR dayOfWeek() in [6, 7]) | "After_Banking_Hours";
+    * | "Unknown_Time";
+]))
+| stats(max(BankingTrojanScore, as=ThreatLevel), count(as=TrojanActivity)) by [aid, TrojanFamily, BrazilianBankingHours]
+| sort(ThreatLevel, order=desc)
+Contexto LATAM: Banking trojans representam 73% dos malwares financeiros na região, com foco em bancos brasileiros.
+
+2. Ransomware-as-a-Service (LockBit/ALPHV/BlackCat)
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*vssadmin.*delete.*shadows.*\/all|.*wbadmin.*delete.*backup|.*bcdedit.*bootstatuspolicy.*ignoreallfailures/i OR
+   CommandLine=/.*wevtutil.*cl.*system|.*wevtutil.*cl.*security|.*wevtutil.*cl.*application/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND
+       RemotePort in [80, 443, 8080, 9050]) // Including TOR
+}, field=aid, key=aid, mode=inner, start=-300s, end=+1800s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=FileWritten
+    | (FileName=/.*readme.*\.txt|.*restore.*\.txt|.*decrypt.*\.txt|.*ransom.*\.txt/i OR
+       FileName=/.*\.lockbit|.*\.alphv|.*\.blackcat|.*\.encrypted/i)
+}, field=aid, key=aid, mode=left, start=+60s, end=+3600s, include=[FileName, FilePath])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*\.br$|.*brazil.*|.*brasil.*|.*\/br\/|.*empresa.*|.*corporativ.*/i // Brazilian targeting
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[CommandLine])
+| eval(RansomwareScore=0)
+| eval(RansomwareScore=if(CommandLine=/.*vssadmin.*delete.*shadows.*\/all/i, RansomwareScore+5, RansomwareScore))
+| eval(RansomwareScore=if(CommandLine=/.*bootstatuspolicy.*ignoreallfailures/i, RansomwareScore+4, RansomwareScore))
+| eval(RansomwareScore=if(FileName=/.*readme.*\.txt|.*restore.*\.txt/i, RansomwareScore+4, RansomwareScore))
+| eval(RansomwareScore=if(RemotePort="9050", RansomwareScore+3, RansomwareScore)) // TOR
+| eval(RansomwareScore=if(CommandLine=/.*brasil.*|.*empresa.*/i, RansomwareScore+2, RansomwareScore)) // Brazilian targeting
+| RansomwareScore >= 8
+| case {
+    (FileName=/.*\.lockbit/i OR CommandLine=/.*lockbit/i) | RansomwareFamily := "LockBit_Attack";
+    (FileName=/.*\.alphv|.*\.blackcat/i) | RansomwareFamily := "ALPHV_BlackCat_Attack";
+    (CommandLine=/.*brasil.*|.*empresa.*/i) | RansomwareFamily := "Brazil_Targeted_Ransomware";
+    * | RansomwareFamily := "Generic_Ransomware_Attack";
+}
+| eval(AttackTiming=case([
+    (Time between ("18:00", "06:00") OR dayOfWeek() in [6, 7]) | "Weekend_Holiday_Attack"; // Common ransomware timing
+    (Time between ("12:00", "14:00")) | "Lunch_Hour_Attack"; // Brazilian lunch hour
+    * | "Business_Hours_Attack";
+]))
+| stats(max(RansomwareScore, as=MaxThreatLevel), count(as=RansomwareEvents)) by [aid, RansomwareFamily, AttackTiming]
+| sort(MaxThreatLevel, order=desc)
+Contexto LATAM: 340% de aumento em ransomware em 2024, com foco em horários não comerciais e feriados.
+
+3. Business Email Compromise (BEC) Brasileiro
+fql
+#event_simpleName=ProcessRollup2
+| ImageFileName=/.*outlook\.exe|.*thunderbird\.exe|.*webview.*/i
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND
+       RemotePort in [25, 587, 993, 995]) // Email ports
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*transferencia.*|.*pagamento.*|.*fatura.*|.*cobranca.*|.*urgente.*|.*diretor.*|.*gerente.*/i // Brazilian BEC keywords
+}, field=aid, key=aid, mode=left, start=-300s, end=+300s, include=[CommandLine])
+| join(query={
+    #event_simpleName=FileWritten
+    | (FileName=/.*fatura.*\.pdf|.*boleto.*\.pdf|.*transferencia.*\.xlsx|.*pagamento.*\.doc/i OR
+       FilePath=/.*downloads.*|.*documentos.*|.*desktop.*/i)
+}, field=aid, key=aid, mode=left, start=-60s, end=+600s, include=[FileName, FilePath])
+| regex("(?P<PIXKey>\\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\b|\\b\\d{11}\\b|\\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}\\b)", field=CommandLine, strict=false)
+| eval(BECScore=0)
+| eval(BECScore=if(CommandLine=/.*transferencia.*urgente|.*pagamento.*urgente/i, BECScore+4, BECScore))
+| eval(BECScore=if(CommandLine=/.*diretor.*|.*gerente.*|.*presidente.*/i, BECScore+3, BECScore)) // Executive impersonation
+| eval(BECScore=if(FileName=/.*fatura.*\.pdf|.*boleto.*\.pdf/i, BECScore+3, BECScore))
+| eval(BECScore=if(PIXKey!="", BECScore+3, BECScore)) // PIX key present
+| eval(BECScore=if(RemotePort in [25, 587], BECScore+1, BECScore))
+| BECScore >= 6
+| case {
+    (CommandLine=/.*transferencia.*pix/i AND PIXKey!="") | BECType := "PIX_Transfer_BEC";
+    (CommandLine=/.*diretor.*urgente|.*gerente.*urgente/i) | BECType := "Executive_Impersonation_BEC";
+    (FileName=/.*fatura.*\.pdf|.*boleto.*\.pdf/i) | BECType := "Invoice_Fraud_BEC";
+    * | BECType := "Generic_Brazilian_BEC";
+}
+| eval(BrazilianBusinessContext=case([
+    (Time between ("14:00", "17:00") AND dayOfWeek() between (1, 5)) | "Late_Afternoon_BEC"; // Common BEC timing in Brazil
+    (Time between ("08:00", "11:00") AND dayOfWeek() between (1, 5)) | "Morning_BEC";
+    * | "Off_Hours_BEC";
+]))
+| stats(max(BECScore, as=MaxBECScore), count(as=BECAttempts)) by [aid, BECType, BrazilianBusinessContext]
+| sort(MaxBECScore, order=desc)
+Contexto LATAM: BEC attacks aumentaram 175% na região, com foco em PIX e transferências bancárias.
+
+4. Cryptomining Malware (XMRig/T-Rex)
+fql
+#event_simpleName=ProcessRollup2
+| (FileName=/.*xmrig.*|.*t-rex.*|.*cryptonight.*|.*monero.*|.*miner.*\.exe/i OR
+   CommandLine=/.*stratum.*pool|.*mining.*pool|.*xmr.*pool|.*cryptonight|.*randomx/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemotePort in [3333, 4444, 8080, 14444] OR // Common mining ports
+       RemoteAddressIP4=/.*pool.*|.*mining.*|.*xmr.*|.*monero.*/i)
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*powershell.*-enc.*|.*cmd.*\/c.*echo.*|.*schtasks.*\/create/i OR
+       ParentImageFileName=/.*winword\.exe|.*excel\.exe|.*outlook\.exe/i) // Office parent
+}, field=aid, key=aid, mode=left, start=-300s, end=+60s, include=[ParentImageFileName, CommandLine])
+| join(query={
+    #event_simpleName=FileWritten
+    | (FilePath=/.*temp.*|.*appdata.*|.*programdata.*|.*public.*/i AND
+       Size > 1048576) // Files > 1MB
+}, field=aid, key=aid, mode=left, start=-120s, end=+120s, include=[FilePath, Size])
+| eval(CryptominingScore=0)
+| eval(CryptominingScore=if(CommandLine=/.*stratum.*pool|.*mining.*pool/i, CryptominingScore+5, CryptominingScore))
+| eval(CryptominingScore=if(FileName=/.*xmrig.*|.*miner.*\.exe/i, CryptominingScore+4, CryptominingScore))
+| eval(CryptominingScore=if(RemotePort in [3333, 4444], CryptominingScore+3, CryptominingScore))
+| eval(CryptominingScore=if(ParentImageFileName=/.*winword\.exe|.*excel\.exe/i, CryptominingScore+2, CryptominingScore))
+| eval(CryptominingScore=if(FilePath=/.*temp.*|.*appdata.*/i, CryptominingScore+1, CryptominingScore))
+| CryptominingScore >= 6
+| case {
+    (FileName=/.*xmrig.*/i) | MinerType := "XMRig_Monero_Miner";
+    (FileName=/.*t-rex.*/i) | MinerType := "T-Rex_GPU_Miner";
+    (CommandLine=/.*randomx/i) | MinerType := "RandomX_CPU_Miner";
+    (ParentImageFileName=/.*winword\.exe|.*excel\.exe/i) | MinerType := "Office_Macro_Delivered_Miner";
+    * | MinerType := "Generic_Cryptocurrency_Miner";
+}
+| eval(MiningContext=case([
+    (Time between ("18:00", "08:00") OR dayOfWeek() in [6, 7]) | "After_Hours_Mining"; // Lower detection risk
+    (CommandLine=/.*-enc/i) | "Encoded_PowerShell_Mining";
+    * | "Business_Hours_Mining";
+]))
+| eval(FileSizeMB=round(Size/1048576, 2))
+| stats(max(CryptominingScore, as=MaxMiningScore), 
+        sum(FileSizeMB, as=TotalMinerSizeMB)) by [aid, MinerType, MiningContext]
+| sort(MaxMiningScore, order=desc)
+Contexto LATAM: Cryptomining representa 45% dos malwares em endpoints corporativos, com picos após horário comercial.
+
+5. Remote Access Trojans (AsyncRAT/njRAT)
+fql
+#event_simpleName=ProcessRollup2
+| (FileName=/.*asyncrat.*|.*njrat.*|.*dcrat.*|.*nanocore.*|.*remcos.*/i OR
+   CommandLine=/.*reverse.*shell|.*tcp.*connect|.*cmd.*shell/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND
+       RemotePort in [80, 443, 8080, 1337, 4444, 6666, 9999]) // Common RAT ports
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*screenshot|.*keylog|.*clipboard|.*webcam|.*microphone/i OR
+       CommandLine=/.*upload.*|.*download.*|.*file.*transfer/i)
+}, field=aid, key=aid, mode=left, start=-60s, end=+300s, include=[CommandLine])
+| join(query={
+    #event_simpleName=FileWritten
+    | (FilePath=/.*startup.*|.*temp.*|.*appdata.*roaming.*/i OR
+       FileName=/.*\.scr$|.*\.pif$|.*\.com$/i)
+}, field=aid, key=aid, mode=left, start=-300s, end=+300s, include=[FilePath, FileName])
+| eval(RATScore=0)
+| eval(RATScore=if(FileName=/.*asyncrat.*|.*njrat.*/i, RATScore+5, RATScore))
+| eval(RATScore=if(CommandLine=/.*screenshot|.*keylog/i, RATScore+4, RATScore))
+| eval(RATScore=if(RemotePort in [1337, 4444, 6666], RATScore+3, RATScore)) // Common RAT ports
+| eval(RATScore=if(CommandLine=/.*upload.*|.*download.*/i, RATScore+2, RATScore))
+| eval(RATScore=if(FilePath=/.*startup.*/i, RATScore+2, RATScore)) // Persistence
+| RATScore >= 7
+| case {
+    (FileName=/.*asyncrat.*/i) | RATFamily := "AsyncRAT_Infection";
+    (FileName=/.*njrat.*/i) | RATFamily := "njRAT_Infection";
+    (CommandLine=/.*reverse.*shell/i) | RATFamily := "Reverse_Shell_RAT";
+    (CommandLine=/.*screenshot.*keylog/i) | RATFamily := "Surveillance_RAT";
+    * | RATFamily := "Generic_Remote_Access_Trojan";
+}
+| eval(C2Geography=case([
+    RemoteAddressIP4=/^(177\.|179\.|181\.|186\.|189\.|200\.|201\.)/i | "Brazilian_C2_Server";
+    RemoteAddressIP4=/^(190\.|191\.|192\.)/i | "Latin_America_C2_Server";
+    * | "International_C2_Server";
+]))
+| stats(max(RATScore, as=MaxRATScore), dc(RemoteAddressIP4, as=UniqueC2Servers)) by [aid, RATFamily, C2Geography]
+| sort(MaxRATScore, order=desc)
+Contexto LATAM: RATs aumentaram 89% na região, com AsyncRAT e njRAT sendo os mais prevalentes.
+
+6. Supply Chain Attacks via Compromised Software
+fql
+#event_simpleName=ProcessRollup2
+| ParentImageFileName=/.*msiexec\.exe|.*setup\.exe|.*install.*\.exe|.*update.*\.exe/i
+| join(query={
+    #event_simpleName=AuthenticodeData
+    | (SubjectCN!="Microsoft Corporation" AND 
+       SubjectCN!=/.*Adobe.*|.*Oracle.*|.*Google.*|.*Symantec.*/i)
+}, field=[aid, TargetProcessId], key=[aid, TargetProcessId], mode=inner, include=[SubjectCN, IssuerCN, Timestamp])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*powershell.*-enc|.*cmd.*\/c.*echo|.*rundll32.*javascript/i OR
+       FileName=/.*temp.*\.exe|.*tmp.*\.exe/i)
+}, field=aid, key=aid, mode=inner, start=+30s, end=+300s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [80, 443, 8080]
+}, field=aid, key=aid, mode=left, start=+60s, end=+600s, include=[RemoteAddressIP4, RemotePort])
+| eval(SupplyChainScore=0)
+| eval(SupplyChainScore=if(ParentImageFileName=/.*msiexec\.exe|.*setup\.exe/i, SupplyChainScore+3, SupplyChainScore))
+| eval(SupplyChainScore=if(SubjectCN!="Microsoft Corporation", SupplyChainScore+2, SupplyChainScore))
+| eval(SupplyChainScore=if(CommandLine=/.*-enc.*-nop/i, SupplyChainScore+4, SupplyChainScore))
+| eval(SupplyChainScore=if(RemoteAddressIP4!="", SupplyChainScore+2, SupplyChainScore))
+| eval(SupplyChainScore=if(FileName=/.*temp.*\.exe|.*tmp.*\.exe/i, SupplyChainScore+2, SupplyChainScore))
+| SupplyChainScore >= 7
+| case {
+    (CommandLine=/.*powershell.*-enc/i AND ParentImageFileName=/.*msiexec\.exe/i) | AttackVector := "MSI_PowerShell_Dropper";
+    (SubjectCN!="Microsoft Corporation" AND RemoteAddressIP4!="") | AttackVector := "Third_Party_Software_C2";
+    (ParentImageFileName=/.*update.*\.exe/i) | AttackVector := "Update_Process_Compromise";
+    * | AttackVector := "Generic_Supply_Chain_Attack";
+}
+| eval(BrazilianSoftwareContext=case([
+    SubjectCN=/.*brasil.*|.*brazil.*|.*ltda.*|.*s\.a\./i | "Brazilian_Software_Vendor";
+    Timestamp<now()-7776000000 | "Expired_Certificate"; // > 90 days old
+    * | "International_Software_Vendor";
+]))
+| stats(max(SupplyChainScore, as=MaxSupplyChainScore), count(as=SupplyChainEvents)) by [aid, AttackVector, BrazilianSoftwareContext, SubjectCN]
+| sort(MaxSupplyChainScore, order=desc)
+Contexto LATAM: Supply chain attacks aumentaram 67%, com foco em software empresarial brasileiro.
+
+7. Credential Harvesting via Phishing (Office 365/Google)
+fql
+#event_simpleName=ProcessRollup2
+| ImageFileName=/.*chrome\.exe|.*firefox\.exe|.*edge\.exe|.*outlook\.exe/i
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND
+       RemotePort in [80, 443])
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=DNSRequest
+    | (DomainName=/.*office.*365.*|.*microsoft.*login|.*google.*accounts|.*outlook.*live/i OR
+       DomainName=/.*\.tk$|.*\.ml$|.*\.cf$|.*\.ga$/i) // Suspicious TLDs
+}, field=aid, key=aid, mode=inner, start=-30s, end=+30s, include=[DomainName])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*login.*|.*signin.*|.*password.*|.*credential.*|.*autenticacao.*/i // Brazilian terms
+}, field=aid, key=aid, mode=left, start=-60s, end=+60s, include=[CommandLine])
+| eval(PhishingScore=0)
+| eval(PhishingScore=if(DomainName=/.*office.*365.*|.*microsoft.*login/i, PhishingScore+4, PhishingScore))
+| eval(PhishingScore=if(DomainName=/.*\.tk$|.*\.ml$/i, PhishingScore+3, PhishingScore))
+| eval(PhishingScore=if(CommandLine=/.*password.*|.*credential.*/i, PhishingScore+2, PhishingScore))
+| eval(PhishingScore=if(CommandLine=/.*autenticacao.*|.*senha.*/i, PhishingScore+2, PhishingScore)) // Brazilian Portuguese
+| PhishingScore >= 5
+| case {
+    (DomainName=/.*office.*365.*/i) | PhishingType := "Office365_Credential_Phishing";
+    (DomainName=/.*google.*accounts/i) | PhishingType := "Google_Workspace_Phishing";
+    (DomainName=/.*\.tk$|.*\.ml$/i) | PhishingType := "Suspicious_TLD_Phishing";
+    (CommandLine=/.*autenticacao.*senha/i) | PhishingType := "Brazilian_Portuguese_Phishing";
+    * | PhishingType := "Generic_Credential_Harvesting";
+}
+| eval(BrazilianLanguageContext=case([
+    (CommandLine=/.*autenticacao.*|.*senha.*|.*acesso.*|.*conta.*/i OR 
+     DomainName=/.*brasil.*|.*br\.com|.*\.com\.br/i) | "Portuguese_Language_Phishing";
+    * | "English_Language_Phishing";
+]))
+| stats(max(PhishingScore, as=MaxPhishingScore), 
+        dc(DomainName, as=UniqueDomains)) by [aid, PhishingType, BrazilianLanguageContext]
+| sort(MaxPhishingScore, order=desc)
+Contexto LATAM: Phishing de credenciais aumentou 156%, com foco em Office 365 e termos em português.
+
+8. Living Off The Land - PowerShell/WMI Abuse
+fql
+#event_simpleName=ProcessRollup2
+| (ImageFileName=/.*powershell\.exe|.*powershell_ise\.exe/i OR
+   CommandLine=/.*wmic.*process.*call.*create|.*invoke-command.*computername/i)
+| CommandLine=/.*-enc.*-nop.*-w.*hidden|.*downloadstring.*http|.*invoke-expression.*new-object/i
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [80, 443, 8080]
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, start=-30s, end=+120s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | ParentImageFileName=/.*winword\.exe|.*excel\.exe|.*outlook\.exe|.*acrobat.*\.exe/i // Office/PDF parent
+}, field=[aid, ParentProcessId], key=[aid, RawProcessId], mode=left, include=[ParentImageFileName])
+| eval(LOTLScore=0)
+| eval(LOTLScore=if(CommandLine=/.*-enc.*-nop.*-w.*hidden/i, LOTLScore+5, LOTLScore))
+| eval(LOTLScore=if(CommandLine=/.*downloadstring.*http/i, LOTLScore+4, LOTLScore))
+| eval(LOTLScore=if(CommandLine=/.*invoke-expression.*new-object/i, LOTLScore+3, LOTLScore))
+| eval(LOTLScore=if(ParentImageFileName=/.*winword\.exe|.*excel\.exe/i, LOTLScore+2, LOTLScore))
+| eval(LOTLScore=if(RemoteAddressIP4!="", LOTLScore+2, LOTLScore))
+| LOTLScore >= 7
+| case {
+    (CommandLine=/.*downloadstring.*http/i AND ParentImageFileName=/.*winword\.exe/i) | LOTLTechnique := "Word_Macro_PowerShell_Download";
+    (CommandLine=/.*invoke-expression.*new-object/i) | LOTLTechnique := "PowerShell_Fileless_Execution";
+    (CommandLine=/.*wmic.*process.*call.*create/i) | LOTLTechnique := "WMI_Remote_Execution";
+    * | LOTLTechnique := "Generic_LOTL_Abuse";
+}
+| eval(BrazilianOfficeContext=case([
+    (ParentImageFileName=/.*winword\.exe/i AND Time between ("14:00", "16:00")) | "Word_Afternoon_Usage"; // Common time for macro attacks in Brazil
+    (ParentImageFileName=/.*excel\.exe/i AND dayOfWeek() between (1, 5)) | "Excel_Weekday_Usage";
+    * | "Standard_Office_Usage";
+]))
+| stats(max(LOTLScore, as=MaxLOTLScore), count(as=LOTLEvents)) by [aid, LOTLTechnique, BrazilianOfficeContext]
+| sort(MaxLOTLScore, order=desc)
+Contexto LATAM: Living off the land attacks representam 82% das detecções avançadas, com PowerShell sendo o vetor principal.
+
+9. Brazilian Invoice/Boleto Fraud
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*boleto.*|.*fatura.*|.*cobranca.*|.*nota.*fiscal.*|.*nf-e.*/i OR
+   FileName=/.*pdf.*|.*excel.*|.*word.*/i)
+| join(query={
+    #event_simpleName=FileWritten
+    | (FileName=/.*boleto.*\.pdf|.*fatura.*\.pdf|.*cobranca.*\.xlsx|.*nf-e.*\.xml/i OR
+       FilePath=/.*downloads.*|.*documentos.*|.*desktop.*/i)
+}, field=aid, key=aid, mode=inner, start=-60s, end=+300s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemotePort in [25, 587, 80, 443] AND
+       RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/)
+}, field=aid, key=aid, mode=left, start=+30s, end=+600s, include=[RemoteAddressIP4, RemotePort])
+| regex("(?P<BoletoNumber>\\b\\d{5}\\.\\d{5}\\s+\\d{5}\\.\\d{6}\\s+\\d{5}\\.\\d{6}\\s+\\d{1}\\s+\\d{14}\\b)", field=CommandLine, strict=false)
+| regex("(?P<CNPJ>\\b\\d{2}\\.\\d{3}\\.\\d{3}/\\d{4}-\\d{2}\\b)", field=CommandLine, strict=false)
+| regex("(?P<MonetaryValue>R\\$\\s*[\\d,]+\\.\\d{2})", field=CommandLine, strict=false)
+| eval(BoletoFraudScore=0)
+| eval(BoletoFraudScore=if(BoletoNumber!="", BoletoFraudScore+4, BoletoFraudScore))
+| eval(BoletoFraudScore=if(FileName=/.*boleto.*\.pdf|.*fatura.*\.pdf/i, BoletoFraudScore+3, BoletoFraudScore))
+| eval(BoletoFraudScore=if(RemotePort in [25, 587], BoletoFraudScore+2, BoletoFraudScore)) // Email distribution
+| eval(BoletoFraudScore=if(CNPJ!="", BoletoFraudScore+2, BoletoFraudScore))
+| eval(BoletoFraudScore=if(MonetaryValue!="", BoletoFraudScore+1, BoletoFraudScore))
+| BoletoFraudScore >= 6
+| case {
+    (BoletoNumber!="" AND RemotePort in [25, 587]) | FraudType := "Boleto_Email_Distribution";
+    (FileName=/.*nf-e.*\.xml/i) | FraudType := "NFe_Invoice_Fraud";
+    (MonetaryValue!="" AND CNPJ!="") | FraudType := "Corporate_Invoice_Fraud";
+    * | FraudType := "Generic_Brazilian_Invoice_Fraud";
+}
+| eval(FraudTiming=case([
+    (Time between ("14:00", "17:00") AND dayOfWeek() between (1, 5)) | "End_Of_Business_Day"; // Common fraud timing
+    (dayOfWeek()=5 AND Time between ("16:00", "18:00")) | "Friday_Afternoon_Fraud";
+    * | "Standard_Business_Hours";
+]))
+| eval(FileSizeKB=round(Size/1024, 2))
+| stats(max(BoletoFraudScore, as=MaxFraudScore), 
+        sum(FileSizeKB, as=TotalDocumentSizeKB)) by [aid, FraudType, FraudTiming]
+| sort(MaxFraudScore, order=desc)
+Contexto LATAM: Fraudes de boleto/fatura representam 65% dos crimes financeiros digitais no Brasil.
+
+10. Advanced Evasion - AMSI/ETW Bypass
+fql
+#event_simpleName=SystemCallActivity
+| SystemCall in ["NtWriteVirtualMemory", "NtProtectVirtualMemory"]
+| TargetAddress=/.*amsi\.dll.*|.*ntdll\.dll.*|.*kernel32\.dll.*/i
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*amsi.*bypass|.*etw.*bypass|.*\[ref\].*assembly.*amsi|.*set-mppreference.*-disablerealtimemonitoring/i
+}, field=[aid, SourceProcessId], key=[aid, RawProcessId], mode=inner, start=-30s, end=+30s, include=[CommandLine, ImageFileName])
+| join(query={
+    #event_simpleName=MemoryProtectionChange
+    | NewProtection="PAGE_EXECUTE_READWRITE"
+    | MemoryRegion=/.*amsi\.dll|.*ntdll\.dll/i
+}, field=[aid, SourceProcessId], key=[aid, ProcessId], mode=inner, include=[NewProtection, OldProtection, MemoryRegion])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*-enc.*-nop|.*invoke-expression.*downloadstring/i // Malicious PowerShell after bypass
+}, field=aid, key=aid, mode=left, start=+30s, end=+300s, include=[CommandLine], suffix="_post_bypass")
+| eval(EvasionScore=0)
+| eval(EvasionScore=if(SystemCall="NtWriteVirtualMemory", EvasionScore+4, EvasionScore))
+| eval(EvasionScore=if(CommandLine=/.*amsi.*bypass/i, EvasionScore+4, EvasionScore))
+| eval(EvasionScore=if(NewProtection="PAGE_EXECUTE_READWRITE", EvasionScore+3, EvasionScore))
+| eval(EvasionScore=if(CommandLine_post_bypass!="", EvasionScore+3, EvasionScore)) // Malicious activity after bypass
+| eval(EvasionScore=if(MemoryRegion=/.*amsi\.dll/i, EvasionScore+2, EvasionScore))
+| EvasionScore >= 9
+| case {
+    (CommandLine=/.*\[ref\].*assembly.*amsi/i) | EvasionTechnique := "PowerShell_Reflection_AMSI_Bypass";
+    (CommandLine=/.*set-mppreference.*-disablerealtimemonitoring/i) | EvasionTechnique := "Windows_Defender_Disable";
+    (SystemCall="NtWriteVirtualMemory" AND MemoryRegion=/.*amsi\.dll/i) | EvasionTechnique := "Direct_AMSI_Patching";
+    (CommandLine=/.*etw.*bypass/i) | EvasionTechnique := "ETW_Evasion";
+    * | EvasionTechnique := "Generic_Security_Bypass";
+}
+| eval(PostBypassActivity=case([
+    CommandLine_post_bypass=/.*downloadstring.*http/i | "Network_Download_Post_Bypass";
+    CommandLine_post_bypass=/.*-enc.*-nop/i | "Encoded_PowerShell_Post_Bypass";
+    CommandLine_post_bypass!="" | "Generic_Malicious_Post_Bypass";
+    * | "No_Post_Bypass_Activity";
+]))
+| stats(max(EvasionScore, as=MaxEvasionScore), count(as=EvasionEvents)) by [aid, EvasionTechnique, PostBypassActivity]
+| sort(MaxEvasionScore, order=desc)
+Contexto LATAM: Advanced evasion techniques aumentaram 234%, com AMSI bypass sendo a técnica mais comum.
