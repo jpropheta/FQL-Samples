@@ -1,0 +1,306 @@
+1. Golden Ticket/Silver Ticket Detection (Kerberos Attacks)
+fql
+#event_simpleName=UserLogon
+| (LogonType="3" AND LogonProcess="Kerberos" AND AuthenticationPackage="Kerberos")
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*mimikatz|.*golden|.*silver|.*kerberos.*ticket/i OR
+       FileName=/.*mimikatz\.exe|.*rubeus\.exe|.*kekeo\.exe/i)
+}, field=aid, key=aid, mode=left, start=-10m, end=+1m, include=[CommandLine, FileName])
+| case {
+    LogonDomain=/.*\.local$|.*\.corp$|.*\.intranet$/i | DomainType := "Internal_Domain";
+    LogonDomain=/.*\.com\.br$|.*\.gov\.br$|.*\.org\.br$/i | DomainType := "Brazilian_Domain";
+    * | DomainType := "Other_Domain";
+}
+| eval(SuspiciousLogin=case([
+    (LogonTime>now()-3600000 AND CommandLine!="") | 5; // Kerberos attack tool used within 1h
+    (UserName=/.*admin.*|.*adm.*|.*service/i AND LogonDomain!="") | 4; // Admin account
+    (Time not between ("06:00", "22:00") AND DomainType="Brazilian_Domain") | 3; // After hours BR
+    * | 1;
+]))
+| SuspiciousLogin >= 3
+| stats(max(SuspiciousLogin, as=RiskScore), count(as=LogonCount), 
+        dc(ComputerName, as=UniqueHosts)) by [UserName, LogonDomain, DomainType]
+| sort(RiskScore, order=desc)
+Propósito: Detecta ataques Kerberos avançados (Golden/Silver Ticket) - técnica favorita de APTs.
+
+2. Cobalt Strike/Empire C2 Beacon Detection
+fql
+#event_simpleName=NetworkConnectIP4
+| RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*powershell.*-enc.*|.*-nop.*-w.*hidden|.*invoke-expression.*downloadstring/i OR
+       CommandLine=/.*rundll32.*javascript|.*regsvr32.*scrobj/i)
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, start=-30s, end=+30s)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=aid, key=aid, mode=inner, start=-5m, end=+5m)
+| eval(BeaconPatterns=0)
+| eval(BeaconPatterns=if(RemotePort in [80, 443, 8080, 8443], BeaconPatterns+1, BeaconPatterns))
+| eval(BeaconPatterns=if(CommandLine=/.*-enc.*-nop/i, BeaconPatterns+2, BeaconPatterns))
+| eval(BeaconPatterns=if(RemoteAddressIP4=/.*\.br$|.*argentina|.*colombia|.*chile/i, BeaconPatterns+1, BeaconPatterns))
+| groupBy([aid, RemoteAddressIP4], function=[count(as=Connections), dc(RemotePort, as=UniquePorts)], limit=max)
+| eval(ConnectionPattern=case([
+    (Connections >= 3 AND Connections <= 10 AND UniquePorts <= 2) | "Potential_Beacon";
+    (Connections > 10 AND BeaconPatterns >= 2) | "Likely_C2_Channel";
+    * | "Unknown_Pattern";
+]))
+| ConnectionPattern!="Unknown_Pattern"
+| stats(sum(Connections, as=TotalConnections), max(BeaconPatterns, as=MaxRisk)) by [aid, RemoteAddressIP4, ConnectionPattern]
+| sort(MaxRisk, order=desc)
+Propósito: Identifica comunicação C2 de ferramentas como Cobalt Strike - usado em 80% dos ransomwares.
+
+3. Lateral Movement via WMI/PSRemoting/RDP
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*wmic.*process.*call.*create|.*powershell.*invoke-command.*computername|.*psexec/i OR
+   FileName=/.*psexec\.exe|.*wmic\.exe/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [135, 445, 5985, 5986, 3389]
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonType in ["3", "10"]
+}, field=aid, key=aid, mode=left, start=-2m, end=+2m, include=[UserName, LogonType])
+| case {
+    (RemotePort="3389" AND Time not between ("07:00", "19:00")) | MovementType := "After_Hours_RDP";
+    (RemotePort in [135, 445] AND CommandLine=/.*wmic/i) | MovementType := "WMI_Lateral_Movement";
+    (RemotePort in [5985, 5986] AND CommandLine=/.*invoke-command/i) | MovementType := "PSRemoting_Movement";
+    (CommandLine=/.*psexec/i) | MovementType := "PsExec_Movement";
+    * | MovementType := "Unknown_Movement";
+}
+| eval(BrazilianTimeZone=case([
+    Time between ("12:00", "14:00") | "Lunch_Hour_Activity"; // Suspicious during lunch
+    Time between ("22:00", "06:00") | "Night_Activity"; // After hours
+    * | "Business_Hours";
+]))
+| (MovementType!="Unknown_Movement" AND BrazilianTimeZone!="Business_Hours")
+| stats(count(as=MovementAttempts), dc(RemoteAddressIP4, as=TargetHosts)) by [aid, UserName, MovementType]
+| sort(MovementAttempts, order=desc)
+Propósito: Detecta movimento lateral - presente em 95% dos ataques avançados.
+
+4. Ransomware Behavior Pattern Detection
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*vssadmin.*delete.*shadows|.*wbadmin.*delete.*catalog|.*bcdedit.*bootstatuspolicy.*ignoreallfailures/i OR
+   CommandLine=/.*cipher.*\/w|.*sdelete.*-z|.*del.*\/s.*\/q.*\*\.log/i)
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | FileName=/.*\.exe$/i
+    | CommandLine=/.*\.txt.*readme|.*\.txt.*restore|.*\.html.*decrypt/i
+}, field=aid, key=aid, mode=left, start=+1m, end=+30m, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [80, 443, 9050] // Including TOR
+}, field=aid, key=aid, mode=left, start=-5m, end=+10m, include=[RemoteAddressIP4])
+| eval(RansomwareIndicators=0)
+| eval(RansomwareIndicators=if(CommandLine=/.*vssadmin.*delete/i, RansomwareIndicators+3, RansomwareIndicators))
+| eval(RansomwareIndicators=if(CommandLine=/.*bootstatuspolicy.*ignore/i, RansomwareIndicators+2, RansomwareIndicators))
+| eval(RansomwareIndicators=if(CommandLine=/.*readme.*\.txt|.*restore.*\.txt/i, RansomwareIndicators+3, RansomwareIndicators))
+| eval(RansomwareIndicators=if(RemotePort="9050", RansomwareIndicators+2, RansomwareIndicators)) // TOR
+| RansomwareIndicators >= 3
+| eval(BrazilianContext=case([
+    (Time between ("18:00", "08:00") OR dayOfWeek() in [6, 7]) | "Weekend_Holiday_Attack"; // Common ransomware timing
+    ComputerName=/.*server.*|.*srv.*|.*dc.*|.*backup/i | "Critical_Infrastructure";
+    * | "Standard_Endpoint";
+]))
+| stats(max(RansomwareIndicators, as=ThreatScore), count(as=MaliciousActions)) by [aid, BrazilianContext]
+| sort(ThreatScore, order=desc)
+Propósito: Detecta comportamentos típicos de ransomware - ameaça #1 para empresas brasileiras.
+
+5. Domain Controller Reconnaissance
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*net.*group.*domain.*admin|.*net.*user.*domain|.*dsquery.*user.*admin/i OR
+   CommandLine=/.*nltest.*\/dclist|.*nslookup.*-type.*srv.*_ldap/i OR
+   CommandLine=/.*ldapsearch|.*adfind|.*bloodhound/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemotePort in [389, 636, 3268, 3269, 88, 53]
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=left, include=[RemoteAddressIP4, RemotePort])
+| case {
+    CommandLine=/.*domain.*admin/i | ReconType := "Domain_Admin_Enum";
+    CommandLine=/.*dclist|.*_ldap/i | ReconType := "Domain_Controller_Discovery";
+    CommandLine=/.*bloodhound|.*sharphound/i | ReconType := "AD_Mapping_Tools";
+    CommandLine=/.*adfind|.*ldapsearch/i | ReconType := "LDAP_Enumeration";
+    * | ReconType := "General_AD_Recon";
+}
+| join(query={
+    #event_simpleName=UserLogon
+    | UserName!=/.*admin.*|.*adm.*|.*service/i // Non-admin user doing admin recon
+}, field=aid, key=aid, mode=inner, start=-5m, end=+1m, include=[UserName])
+| eval(BrazilianBusinessHours=case([
+    (Time between ("08:00", "18:00") AND dayOfWeek() between (1, 5)) | "Business_Hours";
+    (Time between ("12:00", "14:00")) | "Lunch_Time_Recon"; // Suspicious timing
+    * | "After_Hours_Recon";
+]))
+| BrazilianBusinessHours!="Business_Hours"
+| stats(count(as=ReconAttempts), dc(RemoteAddressIP4, as=TargetDCs)) by [aid, UserName, ReconType]
+| sort(ReconAttempts, order=desc)
+Propósito: Detecta reconhecimento de Active Directory - etapa crítica em ataques empresariais.
+
+6. Privilege Escalation via Token Manipulation
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*runas.*\/savecred|.*runas.*\/netonly|.*powershell.*start-process.*credential/i OR
+   FileName=/.*psexec\.exe/i AND CommandLine=/.*-s\s|.*-i\s.*system/i)
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonType="4" // Batch logon - often used in escalation
+}, field=aid, key=aid, mode=left, start=-1m, end=+2m, include=[UserName, LogonType])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | TokenType="TokenElevationTypeFull"
+}, field=aid, key=aid, mode=inner, start=+30s, end=+5m, include=[TokenType, UserName])
+| case {
+    (CommandLine=/.*runas.*\/savecred/i AND TokenType="TokenElevationTypeFull") | EscalationType := "Saved_Credential_Escalation";
+    (CommandLine=/.*psexec.*-s/i) | EscalationType := "PsExec_System_Escalation";
+    (LogonType="4" AND TokenType="TokenElevationTypeFull") | EscalationType := "Batch_Token_Escalation";
+    * | EscalationType := "General_Privilege_Escalation";
+}
+| eval(SuspiciousContext=case([
+    UserName=/.*guest|.*temp|.*test/i | "Suspicious_Account";
+    (Time not between ("08:00", "17:00") AND dayOfWeek() between (1, 5)) | "After_Hours_Brazil";
+    ComputerName=/.*server.*|.*srv.*|.*dc.*/i | "Critical_Server";
+    * | "Standard_Workstation";
+]))
+| stats(count(as=EscalationAttempts), collect([UserName, EscalationType], limit=5)) by [aid, SuspiciousContext]
+| sort(EscalationAttempts, order=desc)
+Propósito: Detecta escalação de privilégios - presente em 90% dos comprometimentos.
+
+7. Fileless Malware & Living-off-the-Land
+fql
+#event_simpleName=ProcessRollup2
+| (FileName=/.*powershell\.exe|.*cmd\.exe|.*wscript\.exe|.*cscript\.exe|.*mshta\.exe/i AND
+   CommandLine=/.*-enc.*-nop|.*invoke-expression.*http|.*iex.*new-object.*downloadstring/i)
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | ParentImageFileName=/.*outlook\.exe|.*winword\.exe|.*excel\.exe|.*acrobat/i
+}, field=aid, key=aid, mode=left, start=-30s, end=+30s, include=[ParentImageFileName])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=left, include=[RemoteAddressIP4])
+| eval(FilelessIndicators=0)
+| eval(FilelessIndicators=if(CommandLine=/.*-enc.*-nop/i, FilelessIndicators+3, FilelessIndicators))
+| eval(FilelessIndicators=if(CommandLine=/.*downloadstring.*http/i, FilelessIndicators+2, FilelessIndicators))
+| eval(FilelessIndicators=if(ParentImageFileName!="", FilelessIndicators+2, FilelessIndicators)) // Office parent
+| eval(FilelessIndicators=if(RemoteAddressIP4!="", FilelessIndicators+1, FilelessIndicators))
+| FilelessIndicators >= 3
+| case {
+    ParentImageFileName=/.*outlook\.exe/i | AttackVector := "Email_Based_Fileless";
+    ParentImageFileName=/.*winword\.exe|.*excel\.exe/i | AttackVector := "Office_Macro_Fileless";
+    FileName=/.*powershell\.exe/i | AttackVector := "PowerShell_Fileless";
+    * | AttackVector := "General_Fileless";
+}
+| stats(max(FilelessIndicators, as=ThreatLevel), count(as=FilelessEvents)) by [aid, UserName, AttackVector]
+| sort(ThreatLevel, order=desc)
+Propósito: Detecta malware sem arquivo - 70% dos ataques modernos são fileless.
+
+8. Persistence via Registry & Services
+fql
+(#event_simpleName=AsepValueUpdate OR #event_simpleName=ServiceInstalled OR #event_simpleName=ScheduledTaskRegistered)
+| case {
+    #event_simpleName="AsepValueUpdate" | PersistenceMethod := "Registry_Autostart";
+    #event_simpleName="ServiceInstalled" | PersistenceMethod := "Windows_Service";
+    #event_simpleName="ScheduledTaskRegistered" | PersistenceMethod := "Scheduled_Task";
+}
+| case {
+    ValueData=/.*powershell.*-enc|.*cmd.*\/c.*echo|.*rundll32.*javascript/i | PersistenceRisk := 4;
+    ValueData=/.*\.tmp|.*\.temp|.*appdata.*roaming/i | PersistenceRisk := 3; 
+    ServiceName=/.*update|.*adobe|.*java|.*microsoft/i | PersistenceRisk := 2; // Legitimate-looking names
+    * | PersistenceRisk := 1;
+}
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | CommandLine=/.*reg.*add|.*sc.*create|.*schtasks.*\/create/i
+}, field=aid, key=aid, mode=left, start=-2m, end=+1m, include=[CommandLine, UserName])
+| eval(BrazilianHours=case([
+    (Time between ("18:01", "07:59") OR dayOfWeek() in [6, 7]) | "Suspicious_Timing";
+    (Time between ("12:00", "14:00")) | "Lunch_Hour"; // Common for Brazilian attacks
+    * | "Business_Hours";
+]))
+| PersistenceRisk >= 2
+| stats(max(PersistenceRisk, as=MaxRisk), count(as=PersistenceAttempts)) by [aid, UserName, PersistenceMethod, BrazilianHours]
+| sort(MaxRisk, order=desc)
+Propósito: Detecta estabelecimento de persistência - essencial para APTs de longo prazo.
+
+9. Data Exfiltration Detection
+fql
+#event_simpleName=ProcessRollup2 
+| (CommandLine=/.*rar\.exe.*-a|.*7z\.exe.*a|.*zip.*-r|.*tar.*-czf/i AND
+   CommandLine!=/.*temp.*log|.*cache.*tmp/i) // Exclude legitimate compression
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [21, 22, 25, 80, 443, 587, 993, 995]
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, start=+30s, end=+10m, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=FileWritten
+    | FileName=/.*\.zip$|.*\.rar$|.*\.7z$|.*\.tar$/i
+    | Size > 10485760 // Files larger than 10MB
+}, field=aid, key=aid, mode=left, start=-5m, end=+5m, include=[FileName, Size])
+| eval(ExfiltrationRisk=case([
+    (Size > 104857600 AND RemotePort in [21, 22]) | 5; // >100MB via FTP/SSH
+    (Size > 52428800 AND RemotePort in [25, 587]) | 4; // >50MB via email
+    (RemotePort in [80, 443] AND CommandLine=/.*rar.*-hp.*-m/i) | 4; // Encrypted archives via HTTP
+    (Size > 10485760) | 2; // >10MB
+    * | 1;
+]))
+| ExfiltrationRisk >= 3
+| eval(BrazilianContext=case([
+    RemoteAddressIP4=/.*\.br$|.*argentina|.*colombia/i | "Latin_America_Transfer";
+    (Time not between ("08:00", "18:00")) | "After_Hours_Transfer";
+    * | "Business_Hours_Transfer";
+]))
+| stats(max(ExfiltrationRisk, as=MaxRisk), sum(Size, as=TotalBytes), 
+        dc(RemoteAddressIP4, as=UniqueDestinations)) by [aid, UserName, BrazilianContext]
+| eval(TotalMB=round(TotalBytes/1048576, 2))
+| sort(MaxRisk, order=desc)
+Propósito: Detecta exfiltração de dados - crescimento de 300% no Brasil em 2024.
+
+10. Advanced Persistent Threat (APT) Behavior Correlation
+fql
+// Multi-stage APT detection combining multiple techniques
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*powershell.*-enc|.*wmic.*process.*call|.*net.*group.*domain.*admin/i OR
+   FileName=/.*psexec\.exe|.*mimikatz\.exe|.*cobalt/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [80, 443, 8080, 53, 9050] // Including DNS tunneling and TOR
+}, field=aid, key=aid, mode=inner, start=-30m, end=+30m, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    (#event_simpleName=AsepValueUpdate OR #event_simpleName=ServiceInstalled)
+}, field=aid, key=aid, mode=left, start=+1m, end=+60m, include=[ServiceName, ValueData])
+| join(query={
+    #event_simpleName=UserLogon
+    | LogonType in ["3", "10"] // Network/RDP logons
+    | UserName=/.*admin.*|.*adm.*|.*service/i
+}, field=aid, key=aid, mode=left, start=-10m, end=+10m, include=[UserName, LogonType])
+| eval(APTScore=0)
+| eval(APTScore=if(CommandLine=/.*-enc.*-nop/i, APTScore+2, APTScore)) // Encoded PowerShell
+| eval(APTScore=if(CommandLine=/.*domain.*admin/i, APTScore+2, APTScore)) // Domain recon
+| eval(APTScore=if(RemotePort="9050", APTScore+3, APTScore)) // TOR usage
+| eval(APTScore=if(ServiceName!="" OR ValueData!="", APTScore+1, APTScore)) // Persistence
+| eval(APTScore=if(UserName=/.*admin/i, APTScore+1, APTScore)) // Admin account
+| APTScore >= 4
+| eval(GeographicContext=case([
+    RemoteAddressIP4=/.*\.cn$|.*\.ru$|.*\.kp$/i | "High_Risk_Geography";
+    RemoteAddressIP4=/.*\.br$|.*\.ar$|.*\.co$/i | "Latin_America";
+    * | "Other_Geography";
+]))
+| eval(TimeContext=case([
+    (Time between ("02:00", "05:00")) | "Deep_Night_Activity"; // Prime APT hours
+    (dayOfWeek() in [6, 7]) | "Weekend_Activity";
+    * | "Weekday_Activity";
+]))
+| stats(max(APTScore, as=ThreatLevel), count(as=APTActivities), 
+        dc(RemoteAddressIP4, as=C2Servers)) by [aid, GeographicContext, TimeContext]
+| sort(ThreatLevel, order=desc)
+Propósito: Correlaciona múltiplas técnicas para detectar APTs - ameaça mais sofisticada para grandes empresas.
