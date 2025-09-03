@@ -1,0 +1,533 @@
+1. AI Model Exfiltration & Intellectual Property Theft
+fql
+#event_simpleName=ProcessRollup2
+| (ImageFileName=/.*python.*|.*jupyter.*|.*anaconda.*/i OR
+   CommandLine=/.*tensorflow.*|.*pytorch.*|.*sklearn.*|.*keras.*|.*transformers.*/i)
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*\.pkl$|.*\.h5$|.*\.onnx$|.*\.pb$|.*\.pth$|.*\.joblib$|.*\.model$/i OR
+       FilePath=/.*models.*|.*checkpoints.*|.*weights.*|.*embeddings.*/i)
+    | Size > 104857600 // Models > 100MB
+}, field=aid, key=aid, mode=inner, start=-300s, end=+300s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [21, 22, 80, 443, 25, 587]
+}, field=aid, key=aid, mode=inner, start=+60s, end=+1800s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*model\.save|.*torch\.save|.*pickle\.dump|.*joblib\.dump/i OR
+       CommandLine=/.*git.*clone.*|.*git.*push.*|.*scp.*|.*rsync.*/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[CommandLine])
+| eval(AIModelTheftScore=0)
+| eval(AIModelTheftScore=if(Size > 1073741824, AIModelTheftScore+5, AIModelTheftScore)) // >1GB models
+| eval(AIModelTheftScore=if(CommandLine=/.*model\.save.*|.*torch\.save/i, AIModelTheftScore+4, AIModelTheftScore))
+| eval(AIModelTheftScore=if(RemotePort in [21, 22], AIModelTheftScore+3, AIModelTheftScore)) // FTP/SSH transfer
+| eval(AIModelTheftScore=if(FileName=/.*\.pkl$|.*\.pth$/i, AIModelTheftScore+3, AIModelTheftScore))
+| eval(AIModelTheftScore=if(CommandLine=/.*git.*push.*models/i, AIModelTheftScore+2, AIModelTheftScore))
+| AIModelTheftScore >= 8
+| case {
+    (CommandLine=/.*transformers.*|.*bert.*|.*gpt.*|.*llama/i AND Size > 1073741824) | ModelType := "Large_Language_Model_Theft";
+    (FileName=/.*vision.*|.*resnet.*|.*yolo.*|.*efficientnet/i) | ModelType := "Computer_Vision_Model_Theft";
+    (CommandLine=/.*sklearn.*|.*xgboost.*|.*lightgbm/i) | ModelType := "ML_Classification_Model_Theft";
+    (FilePath=/.*embeddings.*|.*vectors/i) | ModelType := "Embedding_Vector_Theft";
+    * | ModelType := "Generic_AI_Model_Exfiltration";
+}
+| eval(ModelSizeCategory=case([
+    Size > 10737418240 | "Massive_Model_10GB_Plus"; // >10GB (LLM scale)
+    Size > 1073741824 | "Large_Model_1GB_Plus"; // >1GB  
+    Size > 104857600 | "Medium_Model_100MB_Plus"; // >100MB
+    * | "Small_Model_Under_100MB";
+]))
+| eval(TransferMethod=case([
+    (RemotePort in [21, 22] AND CommandLine=/.*scp.*|.*rsync/i) | "Secure_Transfer_Protocol";
+    (RemotePort in [80, 443] AND CommandLine=/.*git.*push/i) | "Version_Control_Upload";
+    (RemotePort in [25, 587]) | "Email_Model_Transfer";
+    * | "Generic_Network_Transfer";
+]))
+| eval(ModelSizeGB=round(Size/1073741824, 2))
+| stats(max(AIModelTheftScore, as=MaxTheftScore),
+        sum(ModelSizeGB, as=TotalModelSizeGB)) by [aid, ModelType, ModelSizeCategory, TransferMethod]
+| sort(MaxTheftScore, order=desc)
+Técnica Exclusiva: Detecção de exfiltração de modelos de IA através de correlação de size, format e transfer patterns.
+
+2. AI Model Poisoning & Training Data Manipulation
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*training.*|.*fit.*|.*train.*model|.*dataset.*|.*data.*loader/i AND
+   CommandLine=/.*tensorflow.*|.*pytorch.*|.*sklearn.*/i)
+| join(query={
+    #event_simpleName=FileWritten OR #event_simpleName=FileRead
+    | (FileName=/.*train.*\.csv|.*train.*\.json|.*dataset.*\.pkl|.*labels.*\.txt/i OR
+       FilePath=/.*training.*data.*|.*datasets.*|.*corpus.*|.*annotations.*/i)
+}, field=aid, key=aid, mode=inner, start=-1800s, end=+600s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*poison.*|.*adversarial.*|.*backdoor.*|.*trojan.*model/i OR
+       CommandLine=/.*label.*flip|.*data.*corruption|.*noise.*injection/i)
+}, field=aid, key=aid, mode=left, start=-900s, end=+900s, include=[CommandLine])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [80, 443, 8080] // Data download sources
+}, field=aid, key=aid, mode=left, start=-3600s, end=+300s, include=[RemoteAddressIP4, RemotePort])
+| eval(ModelPoisoningScore=0)
+| eval(ModelPoisoningScore=if(CommandLine=/.*poison.*|.*adversarial.*|.*backdoor/i, ModelPoisoningScore+5, ModelPoisoningScore))
+| eval(ModelPoisoningScore=if(CommandLine=/.*label.*flip|.*data.*corruption/i, ModelPoisoningScore+4, ModelPoisoningScore))
+| eval(ModelPoisoningScore=if(FileName=/.*train.*csv.*modified|.*dataset.*corrupted/i, ModelPoisoningScore+3, ModelPoisoningScore))
+| eval(ModelPoisoningScore=if(RemoteAddressIP4!="" AND FilePath=/.*training.*data/i, ModelPoisoningScore+2, ModelPoisoningScore))
+| eval(ModelPoisoningScore=if(Size < 1048576, ModelPoisoningScore+2, ModelPoisoningScore)) // Suspiciously small training files
+| ModelPoisoningScore >= 6
+| case {
+    (CommandLine=/.*backdoor.*model|.*trojan.*model/i) | PoisoningType := "AI_Model_Backdoor_Insertion";
+    (CommandLine=/.*label.*flip.*training/i) | PoisoningType := "Training_Label_Manipulation";
+    (CommandLine=/.*adversarial.*examples.*training/i) | PoisoningType := "Adversarial_Training_Data_Injection";
+    (FileName=/.*dataset.*corrupted|.*poison.*data/i) | PoisoningType := "Training_Dataset_Corruption";
+    * | PoisoningType := "Generic_AI_Model_Poisoning";
+}
+| eval(MLFramework=case([
+    CommandLine=/.*tensorflow/i | "TensorFlow_Framework";
+    CommandLine=/.*pytorch/i | "PyTorch_Framework";
+    CommandLine=/.*sklearn/i | "Scikit_Learn_Framework";
+    CommandLine=/.*keras/i | "Keras_Framework";
+    * | "Generic_ML_Framework";
+]))
+| eval(TrainingDataVolume=case([
+    Size > 1073741824 | "Large_Dataset_1GB_Plus";
+    Size > 104857600 | "Medium_Dataset_100MB_Plus";
+    Size > 10485760 | "Small_Dataset_10MB_Plus";
+    * | "Tiny_Dataset_Under_10MB";
+]))
+| stats(max(ModelPoisoningScore, as=MaxPoisoningScore),
+        count(as=PoisoningEvents)) by [aid, PoisoningType, MLFramework, TrainingDataVolume]
+| sort(MaxPoisoningScore, order=desc)
+Técnica Exclusiva: Detecção de envenenamento de modelos através de training data manipulation patterns.
+
+3. Prompt Injection & LLM Jailbreak Detection
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*openai.*|.*anthropic.*|.*claude.*|.*chatgpt.*|.*gpt-.*|.*llama.*|.*mistral/i OR
+   ImageFileName=/.*python.*|.*node.*|.*curl.*/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4=/.*openai\.com$|.*anthropic\.com$|.*huggingface\.co$/i OR
+       RemotePort in [80, 443, 8080])
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*ignore.*previous.*instructions|.*jailbreak.*|.*system.*prompt.*override/i OR
+       CommandLine=/.*DAN.*mode|.*developer.*mode|.*unrestricted.*mode|.*bypass.*safety/i OR
+       CommandLine=/.*roleplay.*harmful|.*pretend.*you.*are.*not.*ai/i)
+}, field=aid, key=aid, mode=inner, start=-300s, end=+300s, include=[CommandLine])
+| join(query={
+    #event_simpleName=FileWritten OR #event_simpleName=FileRead
+    | (FileName=/.*prompts.*\.txt|.*jailbreak.*\.json|.*injection.*\.py|.*llm.*exploit/i OR
+       FilePath=/.*prompt.*engineering.*|.*llm.*attacks.*|.*ai.*red.*team.*/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[FileName, FilePath])
+| eval(PromptInjectionScore=0)
+| eval(PromptInjectionScore=if(CommandLine=/.*ignore.*previous.*instructions/i, PromptInjectionScore+5, PromptInjectionScore))
+| eval(PromptInjectionScore=if(CommandLine=/.*jailbreak.*|.*DAN.*mode/i, PromptInjectionScore+4, PromptInjectionScore))
+| eval(PromptInjectionScore=if(CommandLine=/.*bypass.*safety.*|.*unrestricted.*mode/i, PromptInjectionScore+4, PromptInjectionScore))
+| eval(PromptInjectionScore=if(FileName=/.*jailbreak.*|.*injection.*|.*exploit/i, PromptInjectionScore+3, PromptInjectionScore))
+| eval(PromptInjectionScore=if(RemoteAddressIP4=/.*openai\.com|.*anthropic\.com/i, PromptInjectionScore+2, PromptInjectionScore))
+| PromptInjectionScore >= 7
+| case {
+    (CommandLine=/.*ignore.*previous.*instructions.*system.*role/i) | InjectionType := "System_Prompt_Override_Injection";
+    (CommandLine=/.*DAN.*mode.*|.*developer.*mode/i) | InjectionType := "Jailbreak_Persona_Injection";
+    (CommandLine=/.*roleplay.*harmful.*pretend.*not.*ai/i) | InjectionType := "Identity_Confusion_Injection";
+    (CommandLine=/.*bypass.*safety.*filter.*harmful/i) | InjectionType := "Safety_Filter_Bypass_Injection";
+    * | InjectionType := "Generic_LLM_Prompt_Injection";
+}
+| eval(LLMProvider=case([
+    RemoteAddressIP4=/.*openai\.com/i | "OpenAI_GPT_Models";
+    RemoteAddressIP4=/.*anthropic\.com/i | "Anthropic_Claude_Models";
+    CommandLine=/.*llama.*|.*mistral/i | "Open_Source_LLM";
+    RemoteAddressIP4=/.*huggingface\.co/i | "HuggingFace_Hosted_Models";
+    * | "Generic_LLM_Provider";
+]))
+| eval(AttackComplexity=case([
+    CommandLine=/.*multi.*turn.*conversation.*jailbreak/i | "Multi_Turn_Complex_Injection";
+    CommandLine=/.*single.*prompt.*ignore.*instructions/i | "Single_Turn_Simple_Injection";
+    FileName=/.*advanced.*prompt.*engineering/i | "Sophisticated_Prompt_Engineering";
+    * | "Basic_Prompt_Manipulation";
+]))
+| stats(max(PromptInjectionScore, as=MaxInjectionScore),
+        count(as=InjectionAttempts)) by [aid, InjectionType, LLMProvider, AttackComplexity]
+| sort(MaxInjectionScore, order=desc)
+Técnica Exclusiva: Detecção de prompt injection attacks através de command line analysis e network correlation.
+
+4. AI Model Inference Attacks & Privacy Violations
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*inference.*|.*predict.*|.*model\.predict|.*forward.*pass|.*batch.*inference/i AND
+   CommandLine=/.*tensorflow.*|.*pytorch.*|.*onnx.*|.*triton.*/i)
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*membership.*inference|.*model.*inversion|.*property.*inference/i OR
+       CommandLine=/.*extraction.*attack|.*reconstruction.*attack|.*privacy.*attack/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[CommandLine])
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*queries.*\.json|.*inputs.*\.csv|.*batch.*requests.*|.*inference.*results/i OR
+       FilePath=/.*model.*serving.*|.*inference.*engine.*|.*prediction.*api.*/i)
+    | Size > 10485760 // Large inference batches >10MB
+}, field=aid, key=aid, mode=inner, start=-300s, end=+1800s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [80, 443, 8080, 9000] // ML serving ports
+}, field=aid, key=aid, mode=left, start=-300s, end=+300s, include=[RemoteAddressIP4, RemotePort])
+| eval(InferenceAttackScore=0)
+| eval(InferenceAttackScore=if(CommandLine=/.*membership.*inference|.*model.*inversion/i, InferenceAttackScore+5, InferenceAttackScore))
+| eval(InferenceAttackScore=if(CommandLine=/.*extraction.*attack|.*reconstruction.*attack/i, InferenceAttackScore+4, InferenceAttackScore))
+| eval(InferenceAttackScore=if(Size > 104857600, InferenceAttackScore+3, InferenceAttackScore)) // >100MB queries
+| eval(InferenceAttackScore=if(FileName=/.*batch.*requests.*queries/i, InferenceAttackScore+2, InferenceAttackScore))
+| eval(InferenceAttackScore=if(RemotePort in [8080, 9000], InferenceAttackScore+2, InferenceAttackScore)) // ML serving
+| InferenceAttackScore >= 6
+| case {
+    (CommandLine=/.*membership.*inference.*training.*data/i) | AttackType := "Membership_Inference_Privacy_Attack";
+    (CommandLine=/.*model.*inversion.*reconstruction/i) | AttackType := "Model_Inversion_Data_Reconstruction";
+    (CommandLine=/.*property.*inference.*demographics/i) | AttackType := "Property_Inference_Demographic_Attack";
+    (CommandLine=/.*extraction.*attack.*steal.*model/i) | AttackType := "Model_Extraction_IP_Theft";
+    * | AttackType := "Generic_AI_Inference_Attack";
+}
+| eval(InferenceScale=case([
+    Size > 1073741824 | "Large_Scale_1GB_Plus_Queries";
+    Size > 104857600 | "Medium_Scale_100MB_Plus_Queries";
+    Size > 10485760 | "Small_Scale_10MB_Plus_Queries";
+    * | "Individual_Query_Scale";
+]))
+| eval(ModelServingFramework=case([
+    CommandLine=/.*triton.*inference.*server/i | "NVIDIA_Triton_Serving";
+    CommandLine=/.*tensorflow.*serving/i | "TensorFlow_Serving";
+    CommandLine=/.*pytorch.*serve|.*torchserve/i | "PyTorch_Serving";
+    CommandLine=/.*onnx.*runtime.*serving/i | "ONNX_Runtime_Serving";
+    * | "Generic_Model_Serving";
+]))
+| eval(QueryVolumeMB=round(Size/1048576, 2))
+| stats(max(InferenceAttackScore, as=MaxAttackScore),
+        sum(QueryVolumeMB, as=TotalQueryVolumeMB)) by [aid, AttackType, InferenceScale, ModelServingFramework]
+| sort(MaxAttackScore, order=desc)
+Técnica Exclusiva: Detecção de ataques de inferência através de batch query analysis e privacy attack patterns.
+
+5. GPU Cluster & Distributed AI Training Attacks
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*nvidia-smi|.*cuda.*|.*rocm.*|.*distributed.*training|.*horovod.*|.*deepspeed/i OR
+   ImageFileName=/.*python.*|.*mpirun.*|.*torchrun.*/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemotePort in [2222, 23456, 29500, 6379] OR // Distributed training ports
+       RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/i) // Internal cluster IPs
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*cryptomining.*|.*xmrig.*|.*ethereum.*|.*bitcoin.*mining/i OR
+       CommandLine=/.*gpu.*hijack|.*cuda.*hijack|.*resource.*steal/i)
+}, field=aid, key=aid, mode=left, start=-1800s, end=+1800s, include=[CommandLine])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*torch\.distributed|.*mpi.*rank|.*nccl.*backend|.*gloo.*backend/i OR
+       CommandLine=/.*master.*addr.*master.*port.*world.*size/i)
+}, field=aid, key=aid, mode=inner, start=-300s, end=+300s, include=[CommandLine])
+| eval(GPUClusterAttackScore=0)
+| eval(GPUClusterAttackScore=if(CommandLine=/.*cryptomining.*|.*xmrig.*|.*bitcoin.*mining/i, GPUClusterAttackScore+5, GPUClusterAttackScore))
+| eval(GPUClusterAttackScore=if(CommandLine=/.*gpu.*hijack|.*cuda.*hijack/i, GPUClusterAttackScore+4, GPUClusterAttackScore))
+| eval(GPUClusterAttackScore=if(RemotePort in [2222, 23456], GPUClusterAttackScore+3, GPUClusterAttackScore)) // Non-standard SSH/training ports
+| eval(GPUClusterAttackScore=if(CommandLine=/.*master.*addr.*|.*world.*size/i, GPUClusterAttackScore+2, GPUClusterAttackScore))
+| eval(GPUClusterAttackScore=if(CommandLine=/.*nvidia-smi.*mining|.*rocm.*mining/i, GPUClusterAttackScore+3, GPUClusterAttackScore))
+| GPUClusterAttackScore >= 6
+| case {
+    (CommandLine=/.*cryptomining.*distributed.*gpu/i) | ClusterThreat := "Distributed_GPU_Cryptomining_Hijack";
+    (CommandLine=/.*cuda.*hijack.*training.*resources/i) | ClusterThreat := "CUDA_Resource_Hijacking_Attack";
+    (CommandLine=/.*torch\.distributed.*unauthorized.*training/i) | ClusterThreat := "Unauthorized_Distributed_Training";
+    (RemotePort=2222 AND CommandLine=/.*ssh.*gpu.*cluster/i) | ClusterThreat := "GPU_Cluster_SSH_Infiltration";
+    * | ClusterThreat := "Generic_GPU_Cluster_Attack";
+}
+| eval(DistributedFramework=case([
+    CommandLine=/.*horovod/i | "Horovod_Distributed_Training";
+    CommandLine=/.*deepspeed/i | "DeepSpeed_Training_Framework";
+    CommandLine=/.*torch\.distributed/i | "PyTorch_Distributed";
+    CommandLine=/.*mpirun.*python/i | "MPI_Based_Training";
+    * | "Generic_Distributed_Framework";
+]))
+| eval(GPUInfrastructure=case([
+    CommandLine=/.*nvidia-smi.*a100|.*h100|.*v100/i | "High_End_NVIDIA_GPUs";
+    CommandLine=/.*rocm.*mi.*|.*amd.*gpu/i | "AMD_ROCm_GPUs";
+    CommandLine=/.*cuda.*compute.*capability/i | "CUDA_Compute_Infrastructure";
+    * | "Generic_GPU_Infrastructure";
+]))
+| stats(max(GPUClusterAttackScore, as=MaxClusterScore),
+        count(as=ClusterAttackEvents),
+        dc(RemoteAddressIP4, as=UniqueClusterNodes)) by [aid, ClusterThreat, DistributedFramework, GPUInfrastructure]
+| sort(MaxClusterScore, order=desc)
+Técnica Exclusiva: Detecção de ataques em clusters de GPU através de distributed training pattern analysis.
+
+6. AI-Powered Malware & Adversarial ML
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*adversarial.*malware|.*ai.*powered.*attack|.*ml.*evasion|.*gan.*malware/i OR
+   CommandLine=/.*deepfake.*|.*voice.*clone|.*face.*swap|.*synthetic.*media/i)
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*foolbox.*|.*cleverhans.*|.*art.*adversarial|.*evasion.*attack/i OR
+       FileName=/.*fgsm.*|.*pgd.*|.*carlini.*wagner.*|.*deepfool.*/i)
+}, field=aid, key=aid, mode=inner, start=-600s, end=+600s, include=[CommandLine, FileName])
+| join(query={
+    #event_simpleName=FileWritten OR #event_simpleName=FileRead
+    | (FileName=/.*adversarial.*examples.*|.*perturbed.*inputs.*|.*crafted.*samples/i OR
+       FilePath=/.*deepfake.*models.*|.*voice.*synthesis.*|.*face.*generation.*/i)
+}, field=aid, key=aid, mode=left, start=-300s, end=+1800s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [80, 443, 8080]
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[RemoteAddressIP4, RemotePort])
+| eval(AIAdversarialScore=0)
+| eval(AIAdversarialScore=if(CommandLine=/.*adversarial.*malware|.*ai.*powered.*attack/i, AIAdversarialScore+5, AIAdversarialScore))
+| eval(AIAdversarialScore=if(CommandLine=/.*deepfake.*|.*voice.*clone|.*face.*swap/i, AIAdversarialScore+4, AIAdversarialScore))
+| eval(AIAdversarialScore=if(CommandLine=/.*foolbox.*|.*cleverhans.*|.*art.*adversarial/i, AIAdversarialScore+4, AIAdversarialScore))
+| eval(AIAdversarialScore=if(FileName=/.*fgsm.*|.*pgd.*|.*carlini.*wagner/i, AIAdversarialScore+3, AIAdversarialScore))
+| eval(AIAdversarialScore=if(FilePath=/.*deepfake.*models|.*voice.*synthesis/i, AIAdversarialScore+3, AIAdversarialScore))
+| AIAdversarialScore >= 8
+| case {
+    (CommandLine=/.*adversarial.*malware.*evasion/i) | AdversarialType := "AI_Powered_Malware_Evasion";
+    (CommandLine=/.*deepfake.*voice.*clone.*impersonation/i) | AdversarialType := "Deepfake_Voice_Impersonation_Attack";
+    (CommandLine=/.*gan.*generated.*malware.*samples/i) | AdversarialType := "GAN_Generated_Malware_Variants";
+    (FileName=/.*fgsm.*pgd.*adversarial.*examples/i) | AdversarialType := "Adversarial_Example_Generation";
+    * | AdversarialType := "Generic_AI_Adversarial_Attack";
+}
+| eval(AdversarialFramework=case([
+    CommandLine=/.*foolbox/i | "Foolbox_Adversarial_Framework";
+    CommandLine=/.*cleverhans/i | "CleverHans_Attack_Library";
+    CommandLine=/.*art.*adversarial/i | "IBM_ART_Adversarial_Toolkit";
+    FileName=/.*fgsm.*|.*pgd/i | "Gradient_Based_Attack_Methods";
+    * | "Custom_Adversarial_Framework";
+]))
+| eval(SyntheticMediaType=case([
+    CommandLine=/.*deepfake.*video/i | "Video_Deepfake_Generation";
+    CommandLine=/.*voice.*clone.*synthesis/i | "Voice_Synthesis_Cloning";
+    CommandLine=/.*face.*swap.*generation/i | "Face_Swap_Generation";
+    FilePath=/.*synthetic.*media.*generation/i | "Multi_Modal_Synthetic_Media";
+    * | "Non_Synthetic_Media_Attack";
+]))
+| stats(max(AIAdversarialScore, as=MaxAdversarialScore),
+        count(as=AdversarialEvents)) by [aid, AdversarialType, AdversarialFramework, SyntheticMediaType]
+| sort(MaxAdversarialScore, order=desc)
+Técnica Exclusiva: Detecção de malware alimentado por IA e ataques adversariais através de ML framework analysis.
+
+7. AI Research & Development Environment Security
+fql
+#event_simpleName=ProcessRollup2
+| (ImageFileName=/.*jupyter.*|.*vscode.*|.*pycharm.*|.*rstudio.*|.*colab.*/i OR
+   CommandLine=/.*notebook.*|.*lab.*|.*tensorboard.*|.*mlflow.*|.*wandb.*/i)
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*\.ipynb$|.*experiment.*\.py|.*research.*\.py|.*paper.*\.py/i OR
+       FilePath=/.*research.*|.*experiments.*|.*papers.*|.*publications.*|.*thesis.*/i)
+}, field=aid, key=aid, mode=inner, start=-600s, end=+600s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemoteAddressIP4=/.*github\.com$|.*gitlab\.com$|.*bitbucket\.com$|.*arxiv\.org$/i OR
+       RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND RemotePort in [22, 80, 443])
+}, field=aid, key=aid, mode=left, start=-300s, end=+1800s, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*proprietary.*research|.*confidential.*experiment|.*patent.*application/i OR
+       CommandLine=/.*intellectual.*property|.*trade.*secret|.*competitive.*advantage/i)
+}, field=aid, key=aid, mode=left, start=-900s, end=+900s, include=[CommandLine])
+| eval(AIResearchSecurityScore=0)
+| eval(AIResearchSecurityScore=if(CommandLine=/.*proprietary.*research|.*confidential.*experiment/i, AIResearchSecurityScore+4, AIResearchSecurityScore))
+| eval(AIResearchSecurityScore=if(CommandLine=/.*intellectual.*property|.*patent.*application/i, AIResearchSecurityScore+4, AIResearchSecurityScore))
+| eval(AIResearchSecurityScore=if(RemoteAddressIP4=/.*github\.com|.*gitlab\.com/i, AIResearchSecurityScore+2, AIResearchSecurityScore))
+| eval(AIResearchSecurityScore=if(FileName=/.*research.*\.py|.*experiment.*\.py/i, AIResearchSecurityScore+2, AIResearchSecurityScore))
+| eval(AIResearchSecurityScore=if(Size > 104857600, AIResearchSecurityScore+2, AIResearchSecurityScore)) // Large research files
+| AIResearchSecurityScore >= 6
+| case {
+    (CommandLine=/.*proprietary.*research.*competitive.*advantage/i) | ResearchThreat := "Proprietary_AI_Research_Exfiltration";
+    (CommandLine=/.*patent.*application.*ai.*algorithm/i AND RemoteAddressIP4!="") | ResearchThreat := "Patent_IP_Research_Theft";
+    (FileName=/.*experiment.*results.*confidential/i) | ResearchThreat := "Confidential_Experiment_Data_Breach";
+    (FilePath=/.*thesis.*dissertation.*ai.*research/i) | ResearchThreat := "Academic_AI_Research_Theft";
+    * | ResearchThreat := "Generic_AI_Research_Environment_Breach";
+}
+| eval(ResearchEnvironment=case([
+    ImageFileName=/.*jupyter.*|.*colab/i | "Jupyter_Notebook_Environment";
+    ImageFileName=/.*vscode.*|.*pycharm/i | "IDE_Development_Environment";
+    CommandLine=/.*tensorboard.*|.*mlflow/i | "ML_Experiment_Tracking";
+    CommandLine=/.*wandb.*|.*neptune/i | "ML_Experiment_Platform";
+    * | "Generic_Research_Environment";
+]))
+| eval(ResearchDomain=case([
+    CommandLine=/.*computer.*vision.*research/i | "Computer_Vision_Research";
+    CommandLine=/.*nlp.*research|.*language.*model.*research/i | "NLP_Language_Model_Research";
+    CommandLine=/.*reinforcement.*learning.*research/i | "Reinforcement_Learning_Research";
+    CommandLine=/.*machine.*learning.*research/i | "General_ML_Research";
+    * | "Multidisciplinary_AI_Research";
+]))
+| eval(ResearchDataSizeGB=round(Size/1073741824, 2))
+| stats(max(AIResearchSecurityScore, as=MaxResearchScore),
+        sum(ResearchDataSizeGB, as=TotalResearchDataGB)) by [aid, ResearchThreat, ResearchEnvironment, ResearchDomain]
+| sort(MaxResearchScore, order=desc)
+Técnica Exclusiva: Proteção de ambientes de pesquisa em IA através de intellectual property pattern recognition.
+
+8. AI Pipeline & MLOps Security Monitoring
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*kubeflow.*|.*mlflow.*|.*airflow.*|.*prefect.*|.*dagster/i OR
+   CommandLine=/.*kubernetes.*ml.*|.*docker.*ml.*|.*containerized.*training/i OR
+   ImageFileName=/.*kubectl.*|.*docker.*|.*podman.*/i)
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*pipeline.*deployment|.*model.*serving|.*a\/b.*testing|.*canary.*deployment/i OR
+       CommandLine=/.*feature.*store|.*data.*versioning|.*experiment.*tracking/i)
+}, field=aid, key=aid, mode=inner, start=-300s, end=+600s, include=[CommandLine])
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*pipeline.*\.yaml|.*workflow.*\.py|.*deployment.*\.yml|.*kubernetes.*ml/i OR
+       FilePath=/.*mlops.*|.*ml.*pipeline.*|.*model.*registry.*|.*feature.*store.*/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[FileName, FilePath])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemotePort in [6443, 8080, 5000, 9000, 3000] OR // K8s API, ML serving, registries
+       RemoteAddressIP4=/.*\.amazonaws\.com$|.*\.azure.*\.com$|.*\.googleapis\.com$/i)
+}, field=aid, key=aid, mode=left, start=-300s, end=+300s, include=[RemoteAddressIP4, RemotePort])
+| eval(MLOpsPipelineScore=0)
+| eval(MLOpsPipelineScore=if(CommandLine=/.*kubeflow.*ml.*pipeline/i, MLOpsPipelineScore+3, MLOpsPipelineScore))
+| eval(MLOpsPipelineScore=if(CommandLine=/.*model.*serving.*production/i, MLOpsPipelineScore+3, MLOpsPipelineScore))
+| eval(MLOpsPipelineScore=if(RemotePort=6443, MLOpsPipelineScore+2, MLOpsPipelineScore)) // K8s API server
+| eval(MLOpsPipelineScore=if(FileName=/.*pipeline.*yaml|.*deployment.*yml/i, MLOpsPipelineScore+2, MLOpsPipelineScore))
+| eval(MLOpsPipelineScore=if(CommandLine=/.*unauthorized.*deployment|.*privilege.*escalation/i, MLOpsPipelineScore+4, MLOpsPipelineScore))
+| MLOpsPipelineScore >= 6
+| case {
+    (CommandLine=/.*kubeflow.*unauthorized.*pipeline/i) | PipelineThreat := "Kubeflow_Pipeline_Unauthorized_Access";
+    (CommandLine=/.*model.*serving.*privilege.*escalation/i) | PipelineThreat := "ML_Serving_Privilege_Escalation";
+    (RemotePort=6443 AND FileName=/.*malicious.*deployment/i) | PipelineThreat := "Kubernetes_ML_Cluster_Compromise";
+    (CommandLine=/.*feature.*store.*data.*exfiltration/i) | PipelineThreat := "Feature_Store_Data_Exfiltration";
+    * | PipelineThreat := "Generic_MLOps_Pipeline_Security_Incident";
+}
+| eval(MLOpsPlatform=case([
+    CommandLine=/.*kubeflow/i | "Kubeflow_ML_Platform";
+    CommandLine=/.*mlflow/i | "MLflow_Lifecycle_Platform";
+    CommandLine=/.*airflow.*ml/i | "Apache_Airflow_ML_Workflows";
+    RemoteAddressIP4=/.*amazonaws\.com/i | "AWS_SageMaker_Platform";
+    * | "Generic_MLOps_Platform";
+]))
+| eval(PipelineStage=case([
+    CommandLine=/.*data.*ingestion.*preprocessing/i | "Data_Ingestion_Preprocessing";
+    CommandLine=/.*training.*pipeline.*distributed/i | "Model_Training_Pipeline";
+    CommandLine=/.*model.*validation.*testing/i | "Model_Validation_Testing";
+    CommandLine=/.*deployment.*serving.*production/i | "Model_Deployment_Serving";
+    * | "Multi_Stage_ML_Pipeline";
+]))
+| stats(max(MLOpsPipelineScore, as=MaxPipelineScore),
+        count(as=PipelineSecurityEvents)) by [aid, PipelineThreat, MLOpsPlatform, PipelineStage]
+| sort(MaxPipelineScore, order=desc)
+Técnica Exclusiva: Monitoramento de segurança em pipelines MLOps através de container e orchestration analysis.
+
+9. AI Data Governance & Privacy Compliance
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*data.*governance|.*privacy.*compliance|.*gdpr.*ml|.*ccpa.*ai|.*lgpd.*dados/i OR
+   CommandLine=/.*differential.*privacy|.*federated.*learning|.*homomorphic.*encryption/i)
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*pii.*dataset.*|.*sensitive.*data.*|.*personal.*info.*|.*biometric.*data/i OR
+       FilePath=/.*gdpr.*compliance.*|.*privacy.*audit.*|.*data.*anonymization.*|.*consent.*management.*/i)
+}, field=aid, key=aid, mode=inner, start=-600s, end=+600s, include=[FileName, FilePath, Size])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*data.*anonymization|.*pseudonymization|.*k.*anonymity|.*l.*diversity/i OR
+       CommandLine=/.*privacy.*preserving.*ml|.*secure.*multiparty.*computation/i)
+}, field=aid, key=aid, mode=left, start=-300s, end=+300s, include=[CommandLine])
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | RemotePort in [80, 443, 25, 587]
+}, field=aid, key=aid, mode=left, start=+60s, end=+1800s, include=[RemoteAddressIP4, RemotePort])
+| regex("(?P<PersonalData>\\b(?:cpf|cnpj|rg|passport|ssn|email|phone)\\b.*\\b(?:dataset|training|model)\\b)", field=CommandLine, strict=false, flags=i)
+| eval(AIPrivacyScore=0)
+| eval(AIPrivacyScore=if(PersonalData!="", AIPrivacyScore+4, AIPrivacyScore))
+| eval(AIPrivacyScore=if(FileName=/.*pii.*dataset|.*sensitive.*data/i, AIPrivacyScore+4, AIPrivacyScore))
+| eval(AIPrivacyScore=if(CommandLine!=/.*differential.*privacy|.*federated.*learning/i AND PersonalData!="", AIPrivacyScore+3, AIPrivacyScore)) // No privacy protection
+| eval(AIPrivacyScore=if(RemoteAddressIP4!="" AND FilePath=/.*personal.*info/i, AIPrivacyScore+3, AIPrivacyScore))
+| eval(AIPrivacyScore=if(CommandLine=/.*lgpd.*dados.*ml/i, AIPrivacyScore+2, AIPrivacyScore)) // Brazilian LGPD context
+| AIPrivacyScore >= 7
+| case {
+    (PersonalData!="" AND CommandLine!=/.*differential.*privacy/i) | PrivacyThreat := "Personal_Data_ML_Without_Privacy_Protection";
+    (FileName=/.*biometric.*data.*training/i) | PrivacyThreat := "Biometric_Data_AI_Training_Violation";
+    (CommandLine=/.*lgpd.*dados.*ai.*compliance/i AND RemoteAddressIP4!="") | PrivacyThreat := "LGPD_AI_Data_Cross_Border_Transfer";
+    (FilePath=/.*consent.*management.*ai/i) | PrivacyThreat := "AI_Consent_Management_Violation";
+    * | PrivacyThreat := "Generic_AI_Privacy_Compliance_Violation";
+}
+| eval(PrivacyRegulation=case([
+    CommandLine=/.*lgpd.*brasil/i | "Brazilian_LGPD_Compliance";
+    CommandLine=/.*gdpr.*european/i | "European_GDPR_Compliance";
+    CommandLine=/.*ccpa.*california/i | "California_CCPA_Compliance";
+    * | "Generic_Privacy_Regulation";
+]))
+| eval(PrivacyTechnique=case([
+    CommandLine=/.*differential.*privacy/i | "Differential_Privacy_Implementation";
+    CommandLine=/.*federated.*learning/i | "Federated_Learning_Approach";
+    CommandLine=/.*homomorphic.*encryption/i | "Homomorphic_Encryption_Method";
+    CommandLine=/.*k.*anonymity|.*l.*diversity/i | "Statistical_Anonymization_Techniques";
+    * | "No_Privacy_Preserving_Techniques";
+]))
+| eval(DataSizeGB=round(Size/1073741824, 2))
+| stats(max(AIPrivacyScore, as=MaxPrivacyScore),
+        sum(DataSizeGB, as=TotalPersonalDataGB)) by [aid, PrivacyThreat, PrivacyRegulation, PrivacyTechnique]
+| sort(MaxPrivacyScore, order=desc)
+Técnica Exclusiva: Detecção de violações de privacidade em IA com foco em regulamentações brasileiras (LGPD).
+
+10. AI Model Deployment & Production Security
+fql
+#event_simpleName=ProcessRollup2
+| (CommandLine=/.*model.*deployment|.*production.*serving|.*inference.*endpoint|.*api.*gateway.*ml/i OR
+   ImageFileName=/.*gunicorn.*|.*uvicorn.*|.*flask.*|.*fastapi.*|.*nginx.*/i)
+| join(query={
+    #event_simpleName=NetworkConnectIP4
+    | (RemotePort in [80, 443, 8000, 8080, 5000, 9000] AND
+       RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/)
+}, field=[aid, TargetProcessId], key=[aid, RawProcessId], mode=inner, include=[RemoteAddressIP4, RemotePort])
+| join(query={
+    #event_simpleName=ProcessRollup2
+    | (CommandLine=/.*model.*poisoning|.*adversarial.*input|.*backdoor.*trigger|.*evasion.*attack/i OR
+       CommandLine=/.*unauthorized.*inference|.*model.*stealing|.*extraction.*api/i)
+}, field=aid, key=aid, mode=left, start=-600s, end=+600s, include=[CommandLine])
+| join(query={
+    #event_simpleName=FileRead OR #event_simpleName=FileWritten
+    | (FileName=/.*model.*\.pkl|.*model.*\.h5|.*model.*\.onnx|.*model.*\.pb/i OR
+       FilePath=/.*production.*models.*|.*serving.*cache.*|.*inference.*logs.*/i)
+}, field=aid, key=aid, mode=left, start=-300s, end=+300s, include=[FileName, FilePath, Size])
+| eval(ProductionAIScore=0)
+| eval(ProductionAIScore=if(CommandLine=/.*model.*poisoning|.*backdoor.*trigger/i, ProductionAIScore+5, ProductionAIScore))
+| eval(ProductionAIScore=if(CommandLine=/.*unauthorized.*inference|.*model.*stealing/i, ProductionAIScore+4, ProductionAIScore))
+| eval(ProductionAIScore=if(CommandLine=/.*adversarial.*input.*evasion/i, ProductionAIScore+4, ProductionAIScore))
+| eval(ProductionAIScore=if(RemotePort in [8000, 8080] AND FileName=/.*model.*\.pkl/i, ProductionAIScore+3, ProductionAIScore))
+| eval(ProductionAIScore=if(CommandLine=/.*extraction.*api.*batch.*queries/i, ProductionAIScore+3, ProductionAIScore))
+| ProductionAIScore >= 7
+| case {
+    (CommandLine=/.*model.*poisoning.*production.*serving/i) | ProductionThreat := "Production_Model_Poisoning_Attack";
+    (CommandLine=/.*adversarial.*input.*inference.*endpoint/i) | ProductionThreat := "Adversarial_Input_Inference_Attack";
+    (CommandLine=/.*model.*stealing.*extraction.*api/i) | ProductionThreat := "Production_Model_Extraction_Attack";
+    (CommandLine=/.*backdoor.*trigger.*production.*model/i) | ProductionThreat := "Backdoor_Trigger_Production_Attack";
+    * | ProductionThreat := "Generic_Production_AI_Security_Incident";
+}
+| eval(ServingFramework=case([
+    ImageFileName=/.*gunicorn.*|.*uvicorn/i | "ASGI_WSGI_Python_Serving";
+    ImageFileName=/.*flask.*|.*fastapi/i | "Flask_FastAPI_Framework";
+    CommandLine=/.*tensorflow.*serving/i | "TensorFlow_Serving_Framework";
+    CommandLine=/.*torchserve.*pytorch/i | "PyTorch_Serving_Framework";
+    * | "Generic_Model_Serving_Framework";
+]))
+| eval(DeploymentEnvironment=case([
+    RemoteAddressIP4=/.*amazonaws\.com|.*azure.*\.com|.*googleapis\.com/i | "Cloud_Production_Deployment";
+    RemotePort in [80, 443] | "Web_Production_Deployment";
+    RemotePort in [8000, 8080, 5000] | "Development_Staging_Deployment";
+    * | "Internal_Production_Deployment";
+]))
+| eval(ModelSizeGB=round(Size/1073741824, 2))
+| stats(max(ProductionAIScore, as=MaxProductionScore),
+        count(as=ProductionSecurityEvents),
+        sum(ModelSizeGB, as=TotalProductionModelSizeGB)) by [aid, ProductionThreat, ServingFramework, DeploymentEnvironment]
+| sort(MaxProductionScore, order=desc)
+Técnica Exclusiva: Monitoramento de segurança em modelos de IA em produção através de serving framework analysis.
